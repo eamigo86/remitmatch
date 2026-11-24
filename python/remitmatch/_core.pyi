@@ -4,6 +4,8 @@ from collections.abc import Sequence
 from datetime import date
 from typing import Self, final
 
+import pyarrow
+
 from remitmatch._enums import MatchKind, MatchStatus
 
 __all__ = [
@@ -12,6 +14,7 @@ __all__ = [
     "MatchConfig",
     "Payment",
     "ReconciliationResult",
+    "reconcile",
     "version",
 ]
 
@@ -20,6 +23,29 @@ def version() -> str:
 
     Returns:
         The semantic version string of the remitmatch crate.
+    """
+
+def reconcile(
+    invoices: Sequence[Invoice],
+    payments: Sequence[Payment],
+    config: MatchConfig | None = None,
+) -> ReconciliationResult:
+    """Match payments against open invoices.
+
+    Runs in Rust and releases the GIL. Each invoice and payment appears in at most one
+    match. The inputs are copied before matching starts.
+
+    Args:
+        invoices: Open invoices to settle, as a list or tuple.
+        payments: Bank movements received, as a list or tuple.
+        config: Tolerances and thresholds; defaults to MatchConfig().
+
+    Returns:
+        Matches with per-signal breakdown, plus unmatched ids on each side.
+
+    Raises:
+        ValueError: An id repeats on one side, or the config is invalid.
+        TypeError: An input is not a sequence of the expected objects.
     """
 
 @final
@@ -287,5 +313,15 @@ class ReconciliationResult:
     @property
     def unmatched_invoices(self) -> list[str]:
         """Invoice ids with no acceptable candidate; a new list on each access."""
+
+    def to_arrow(self) -> pyarrow.Table:
+        """Return matches as a flat Arrow table (one row per payment-invoice pair).
+
+        Returns:
+            A table with one row for each payment-invoice pair in every match.
+
+        Raises:
+            NotImplementedError: Always, because Arrow output is planned for a later release.
+        """
 
     __hash__: None  # type: ignore[assignment]
