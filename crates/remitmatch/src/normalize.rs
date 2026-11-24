@@ -1,10 +1,5 @@
 //! Text normalization for payment references, invoice numbers and counterparty names.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the engine in a later commit")
-)]
-
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
 /// Trailing legal-form tokens ignored when comparing names.
