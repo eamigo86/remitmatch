@@ -104,6 +104,66 @@ fn repr_fields(obj: &Bound<'_, PyAny>, class: &str, fields: &[&str]) -> PyResult
     Ok(format!("{class}({})", parts.join(", ")))
 }
 
+/// Constructor argument names of the Python class, in order.
+const INVOICE_FIELDS: &[&str] = &[
+    "id",
+    "number",
+    "amount_minor",
+    "currency",
+    "issue_date",
+    "due_date",
+    "counterparty",
+    "scope",
+];
+
+/// Constructor argument names of the Python class, in order.
+const PAYMENT_FIELDS: &[&str] = &[
+    "id",
+    "amount_minor",
+    "currency",
+    "value_date",
+    "reference",
+    "counterparty",
+    "scope",
+];
+
+/// Constructor argument names of the Python class, in order.
+const CONFIG_FIELDS: &[&str] = &[
+    "amount_tolerance_minor",
+    "date_window_days",
+    "max_group_size",
+    "auto_threshold",
+    "suggest_threshold",
+    "ambiguity_margin",
+    "weights",
+];
+
+/// Constructor argument names of the Python class, in order.
+const MATCH_FIELDS: &[&str] = &[
+    "kind",
+    "status",
+    "payment_ids",
+    "invoice_ids",
+    "score",
+    "breakdown",
+    "residual_minor",
+];
+
+/// Constructor argument names of the Python class, in order.
+const RESULT_FIELDS: &[&str] = &["matches", "unmatched_payments", "unmatched_invoices"];
+
+/// Returns the class of `obj` and its constructor arguments, as `__reduce__` expects.
+fn reduce_fields<'py>(
+    obj: &Bound<'py, PyAny>,
+    fields: &[&str],
+) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyTuple>)> {
+    let args = fields
+        .iter()
+        .map(|field| obj.getattr(*field))
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok((obj.get_type().into_any(), PyTuple::new(obj.py(), args)?))
+}
+
 /// An open receivable that payments can settle.
 ///
 /// Args:
@@ -203,20 +263,13 @@ impl PyInvoice {
     }
 
     fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
-        repr_fields(
-            slf.as_any(),
-            "Invoice",
-            &[
-                "id",
-                "number",
-                "amount_minor",
-                "currency",
-                "issue_date",
-                "due_date",
-                "counterparty",
-                "scope",
-            ],
-        )
+        repr_fields(slf.as_any(), "Invoice", INVOICE_FIELDS)
+    }
+
+    fn __reduce__<'py>(
+        slf: &Bound<'py, Self>,
+    ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyTuple>)> {
+        reduce_fields(slf.as_any(), INVOICE_FIELDS)
     }
 }
 
@@ -308,19 +361,13 @@ impl PyPayment {
     }
 
     fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
-        repr_fields(
-            slf.as_any(),
-            "Payment",
-            &[
-                "id",
-                "amount_minor",
-                "currency",
-                "value_date",
-                "reference",
-                "counterparty",
-                "scope",
-            ],
-        )
+        repr_fields(slf.as_any(), "Payment", PAYMENT_FIELDS)
+    }
+
+    fn __reduce__<'py>(
+        slf: &Bound<'py, Self>,
+    ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyTuple>)> {
+        reduce_fields(slf.as_any(), PAYMENT_FIELDS)
     }
 }
 
@@ -421,19 +468,13 @@ impl PyMatchConfig {
     }
 
     fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
-        repr_fields(
-            slf.as_any(),
-            "MatchConfig",
-            &[
-                "amount_tolerance_minor",
-                "date_window_days",
-                "max_group_size",
-                "auto_threshold",
-                "suggest_threshold",
-                "ambiguity_margin",
-                "weights",
-            ],
-        )
+        repr_fields(slf.as_any(), "MatchConfig", CONFIG_FIELDS)
+    }
+
+    fn __reduce__<'py>(
+        slf: &Bound<'py, Self>,
+    ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyTuple>)> {
+        reduce_fields(slf.as_any(), CONFIG_FIELDS)
     }
 }
 
@@ -525,19 +566,13 @@ impl PyMatch {
     }
 
     fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
-        repr_fields(
-            slf.as_any(),
-            "Match",
-            &[
-                "kind",
-                "status",
-                "payment_ids",
-                "invoice_ids",
-                "score",
-                "breakdown",
-                "residual_minor",
-            ],
-        )
+        repr_fields(slf.as_any(), "Match", MATCH_FIELDS)
+    }
+
+    fn __reduce__<'py>(
+        slf: &Bound<'py, Self>,
+    ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyTuple>)> {
+        reduce_fields(slf.as_any(), MATCH_FIELDS)
     }
 }
 
@@ -604,11 +639,13 @@ impl PyReconciliationResult {
     }
 
     fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
-        repr_fields(
-            slf.as_any(),
-            "ReconciliationResult",
-            &["matches", "unmatched_payments", "unmatched_invoices"],
-        )
+        repr_fields(slf.as_any(), "ReconciliationResult", RESULT_FIELDS)
+    }
+
+    fn __reduce__<'py>(
+        slf: &Bound<'py, Self>,
+    ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyTuple>)> {
+        reduce_fields(slf.as_any(), RESULT_FIELDS)
     }
 }
 
