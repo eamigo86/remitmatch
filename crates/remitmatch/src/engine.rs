@@ -346,8 +346,9 @@ impl Engine<'_> {
 
     /// Greedily accepts the best candidates whose payment and invoice are both free.
     ///
-    /// An accepted match is ambiguous when its payment has another candidate in this
-    /// pass, of any score and taken or not, within the ambiguity margin.
+    /// A payment's match is ambiguous when its two best candidates in this pass (any score,
+    /// taken or not) are closer than the ambiguity margin; the flag applies to whichever of
+    /// its candidates is accepted. A payment with a single candidate is never ambiguous.
     fn assign(&self, mut candidates: Vec<Candidate>, state: &mut Assigned) {
         let config = self.config;
         let mut top_two: HashMap<usize, (f64, f64)> = HashMap::new();
@@ -376,8 +377,7 @@ impl Engine<'_> {
             state.payment_taken[c.payment] = true;
             state.invoice_taken[c.invoice] = true;
             let (first, second) = top_two[&c.payment];
-            let best_other = if c.score == first { second } else { first };
-            let status = if c.score - best_other + EPS < config.ambiguity_margin {
+            let status = if first - second + EPS < config.ambiguity_margin {
                 MatchStatus::Ambiguous
             } else if meets(c.score, config.auto_threshold) {
                 MatchStatus::Auto
