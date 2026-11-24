@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{Days, NaiveDate};
 use common::{Noise, generate};
 use proptest::prelude::*;
+use proptest::strategy::ValueTree;
+use proptest::test_runner::TestRunner;
 use remitmatch::{
     Invoice, MatchConfig, MatchKind, MatchStatus, Payment, ReconciliationResult, reconcile,
 };
@@ -76,30 +78,34 @@ fn config_strategy() -> impl Strategy<Value = MatchConfig> {
         0.0..=1.0f64,
         0.0..0.2f64,
         weights,
+        0..=4usize,
     )
-        .prop_map(|(tolerance, window, a, b, margin, weights)| {
-            let mut config = MatchConfig {
-                amount_tolerance_minor: tolerance,
-                date_window_days: window,
-                auto_threshold: a.max(b),
-                suggest_threshold: a.min(b),
-                ambiguity_margin: margin,
-                ..MatchConfig::default()
-            };
-            if let Some((r, am, n, d)) = weights {
-                // The reference weight is shifted so the sum is always positive.
-                config.weights = [
-                    ("reference", r + 0.01),
-                    ("amount", am),
-                    ("name", n),
-                    ("date", d),
-                ]
-                .into_iter()
-                .map(|(k, v)| (k.to_owned(), v))
-                .collect();
-            }
-            config
-        })
+        .prop_map(
+            |(tolerance, window, a, b, margin, weights, max_group_size)| {
+                let mut config = MatchConfig {
+                    amount_tolerance_minor: tolerance,
+                    date_window_days: window,
+                    max_group_size,
+                    auto_threshold: a.max(b),
+                    suggest_threshold: a.min(b),
+                    ambiguity_margin: margin,
+                    ..MatchConfig::default()
+                };
+                if let Some((r, am, n, d)) = weights {
+                    // The reference weight is shifted so the sum is always positive.
+                    config.weights = [
+                        ("reference", r + 0.01),
+                        ("amount", am),
+                        ("name", n),
+                        ("date", d),
+                    ]
+                    .into_iter()
+                    .map(|(k, v)| (k.to_owned(), v))
+                    .collect();
+                }
+                config
+            },
+        )
 }
 
 fn input_strategy() -> impl Strategy<Value = (Vec<Invoice>, Vec<Payment>, MatchConfig)> {
@@ -163,6 +169,15 @@ fn check(
             sizes => return Err(TestCaseError::fail(format!("bad group shape {sizes:?}"))),
         };
         prop_assert_eq!(m.kind, expected_kind);
+        match m.kind {
+            MatchKind::OneToOne => {}
+            MatchKind::OneToMany => {
+                prop_assert!((2..=config.max_group_size).contains(&m.invoice_ids.len()));
+            }
+            MatchKind::ManyToOne => {
+                prop_assert!((2..=config.max_group_size).contains(&m.payment_ids.len()));
+            }
+        }
         let mut payment_sum = 0_i128;
         let mut invoice_sum = 0_i128;
         for pid in &m.payment_ids {
@@ -215,6 +230,23 @@ fn check(
     prop_assert_eq!(seen_invoices.len(), invoices.len());
     prop_assert!(result.matches.windows(2).all(|w| w[0].score >= w[1].score));
     Ok(())
+}
+
+/// Draws a fixed number of adversarial inputs and proves the group invariants are not vacuous.
+#[test]
+fn adversarial_inputs_produce_both_group_kinds() {
+    let mut runner = TestRunner::deterministic();
+    let strategy = input_strategy();
+    let (mut one_to_many, mut many_to_one) = (0, 0);
+    for _ in 0..3000 {
+        let (invoices, payments, config) = strategy.new_tree(&mut runner).unwrap().current();
+        for m in reconcile(&invoices, &payments, &config).unwrap().matches {
+            one_to_many += usize::from(m.kind == MatchKind::OneToMany);
+            many_to_one += usize::from(m.kind == MatchKind::ManyToOne);
+        }
+    }
+    assert!(one_to_many > 0, "no 1:N matches in 3000 cases");
+    assert!(many_to_one > 0, "no N:1 matches in 3000 cases");
 }
 
 proptest! {
