@@ -262,10 +262,8 @@ impl Engine<'_> {
             .collect();
         self.assign(candidates, state);
 
-        let candidates = self.invoice_groups_by_name(invoice_rows, payment_rows, &mentions, state);
-        self.assign(candidates, state);
-        let candidates = self.payment_groups_by_name(invoice_rows, payment_rows, &mentions, state);
-        self.assign(candidates, state);
+        self.match_invoice_groups_by_name(invoice_rows, payment_rows, &mentions, state);
+        self.match_payment_groups_by_name(invoice_rows, payment_rows, &mentions, state);
         Ok(())
     }
 
@@ -503,28 +501,33 @@ impl Engine<'_> {
         named as f64 / (payments.len() * invoices.len()) as f64
     }
 
-    /// Builds the 1:N candidates of each open payment from its counterparty's open invoices.
+    /// Matches each open payment, oldest first, to a group of its counterparty's invoices.
     ///
-    /// The pool holds the open invoices whose name reaches [`GROUP_NAME_THRESHOLD`], that fall
-    /// inside the date window and that do not exceed the payment plus the tolerance. The
-    /// reference signal is the share of pairs the payment names exactly.
-    fn invoice_groups_by_name(
+    /// Anchors are taken one at a time and each assigns before the next builds its pool, so
+    /// a pool only holds rows that are still free. The pool holds the open invoices whose
+    /// name reaches [`GROUP_NAME_THRESHOLD`], that fall inside the date window and that do
+    /// not exceed the payment plus the tolerance. The reference signal is the share of pairs
+    /// the payment names exactly.
+    fn match_invoice_groups_by_name(
         &self,
         invoice_rows: &[usize],
         payment_rows: &[usize],
         mentions: &Mentions,
-        state: &Assigned,
-    ) -> Vec<Candidate> {
+        state: &mut Assigned,
+    ) {
         let invoices = by_name(invoice_rows, &state.invoice_taken, &self.invoice_name);
-        let payments: Vec<usize> = payment_rows
-            .iter()
-            .copied()
-            .filter(|&p| !state.payment_taken[p])
-            .collect();
+        let payments = oldest(
+            payment_rows
+                .iter()
+                .copied()
+                .filter(|&p| !state.payment_taken[p])
+                .collect(),
+            |p| self.payments[p].value_date,
+        );
         let names = payments.iter().map(|&p| self.payment_name[p].as_str());
         let similar = similar_buckets(names, &invoices);
-        let mut candidates = Vec::new();
         for p in payments {
+            let mut candidates = Vec::new();
             let pay = &self.payments[p];
             let limit = i128::from(pay.amount_minor) + i128::from(self.tolerance);
             let pool = similar
@@ -534,7 +537,8 @@ impl Engine<'_> {
                 .flat_map(|rows| rows.iter().copied())
                 .filter(|&i| {
                     let inv = &self.invoices[i];
-                    i128::from(inv.amount_minor) <= limit
+                    !state.invoice_taken[i]
+                        && i128::from(inv.amount_minor) <= limit
                         && self.within_window(pay.value_date, inv.due_date)
                 })
                 .collect();
@@ -545,32 +549,35 @@ impl Engine<'_> {
                 let reference = self.mention_share(mentions, &[p], &group);
                 candidates.push(self.candidate(Anchor::Payment(p), vec![p], group, reference));
             }
+            self.assign(candidates, state);
         }
-        candidates
     }
 
-    /// Builds the N:1 candidates of each open invoice from its counterparty's open payments.
+    /// Matches each open invoice, oldest first, to a group of its counterparty's payments.
     ///
-    /// Mirror of [`Self::invoice_groups_by_name`]: the pool holds the open payments whose
-    /// name reaches [`GROUP_NAME_THRESHOLD`], inside the date window and not above the
-    /// invoice plus the tolerance.
-    fn payment_groups_by_name(
+    /// Mirror of [`Self::match_invoice_groups_by_name`]: anchors assign one at a time, and
+    /// the pool holds the free payments whose name reaches [`GROUP_NAME_THRESHOLD`], inside
+    /// the date window and not above the invoice plus the tolerance.
+    fn match_payment_groups_by_name(
         &self,
         invoice_rows: &[usize],
         payment_rows: &[usize],
         mentions: &Mentions,
-        state: &Assigned,
-    ) -> Vec<Candidate> {
+        state: &mut Assigned,
+    ) {
         let payments = by_name(payment_rows, &state.payment_taken, &self.payment_name);
-        let invoices: Vec<usize> = invoice_rows
-            .iter()
-            .copied()
-            .filter(|&i| !state.invoice_taken[i])
-            .collect();
+        let invoices = oldest(
+            invoice_rows
+                .iter()
+                .copied()
+                .filter(|&i| !state.invoice_taken[i])
+                .collect(),
+            |i| self.invoices[i].due_date,
+        );
         let names = invoices.iter().map(|&i| self.invoice_name[i].as_str());
         let similar = similar_buckets(names, &payments);
-        let mut candidates = Vec::new();
         for i in invoices {
+            let mut candidates = Vec::new();
             let inv = &self.invoices[i];
             let limit = i128::from(inv.amount_minor) + i128::from(self.tolerance);
             let pool = similar
@@ -580,7 +587,8 @@ impl Engine<'_> {
                 .flat_map(|rows| rows.iter().copied())
                 .filter(|&p| {
                     let pay = &self.payments[p];
-                    i128::from(pay.amount_minor) <= limit
+                    !state.payment_taken[p]
+                        && i128::from(pay.amount_minor) <= limit
                         && self.within_window(pay.value_date, inv.due_date)
                 })
                 .collect();
@@ -591,8 +599,8 @@ impl Engine<'_> {
                 let reference = self.mention_share(mentions, &group, &[i]);
                 candidates.push(self.candidate(Anchor::Invoice(i), group, vec![i], reference));
             }
+            self.assign(candidates, state);
         }
-        candidates
     }
 
     /// Greedily accepts the best candidates whose payments and invoices are all free.

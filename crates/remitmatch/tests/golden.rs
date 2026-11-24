@@ -999,3 +999,34 @@ fn the_one_to_one_pass_runs_before_the_group_passes() {
     assert_eq!(r.matches[0].invoice_ids, vec!["i3"]);
     assert_eq!(r.unmatched_invoices, vec!["i1", "i2"]);
 }
+
+#[test]
+fn counterparty_anchors_choose_among_the_rows_still_free() {
+    // One payer, no references: 30 invoices of 100 and 15 payments of 200 pair up exactly.
+    // Every payment has more than 24 eligible invoices, so each search must see only the
+    // invoices that earlier payments left free.
+    let invoices: Vec<Invoice> = (0..30)
+        .map(|k| inv(&format!("i{k:02}"), &format!("INV-{k:02}"), 100))
+        .collect();
+    let payments: Vec<Payment> = (0..15)
+        .map(|k| pay(&format!("p{k:02}"), 200, "thanks"))
+        .collect();
+    let r = run(&invoices, &payments, &no_reference_config());
+    assert_eq!(r.matches.len(), 15);
+    assert!(r.matches.iter().all(|m| m.kind == MatchKind::OneToMany));
+    assert!(r.unmatched_payments.is_empty() && r.unmatched_invoices.is_empty());
+}
+
+#[test]
+fn counterparty_invoice_anchors_choose_among_the_payments_still_free() {
+    let invoices: Vec<Invoice> = (0..15)
+        .map(|k| inv(&format!("i{k:02}"), &format!("INV-{k:02}"), 200))
+        .collect();
+    let payments: Vec<Payment> = (0..30)
+        .map(|k| pay(&format!("p{k:02}"), 100, "thanks"))
+        .collect();
+    let r = run(&invoices, &payments, &no_reference_config());
+    assert_eq!(r.matches.len(), 15);
+    assert!(r.matches.iter().all(|m| m.kind == MatchKind::ManyToOne));
+    assert!(r.unmatched_payments.is_empty() && r.unmatched_invoices.is_empty());
+}
