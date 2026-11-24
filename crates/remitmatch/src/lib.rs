@@ -39,7 +39,7 @@ pub fn version() -> &'static str {
 }
 
 /// An open receivable that payments can settle.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Invoice {
     /// Unique invoice identifier in the caller's system.
     pub id: String,
@@ -60,7 +60,7 @@ pub struct Invoice {
 }
 
 /// A bank movement received that may settle one or more invoices.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Payment {
     /// Unique movement identifier from the bank feed.
     pub id: String,

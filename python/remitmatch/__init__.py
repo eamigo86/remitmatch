@@ -5,10 +5,29 @@ Version 0.0.1 reserves the package name. The matching engine is planned for 0.1.
 
 from typing import NoReturn
 
-from remitmatch._core import version
+from remitmatch._core import (
+    Invoice,
+    Match,
+    MatchConfig,
+    Payment,
+    ReconciliationResult,
+    version,
+)
+from remitmatch._enums import MatchKind, MatchStatus
 
 __version__ = version()
-__all__ = ["__version__", "reconcile", "version"]
+__all__ = [
+    "Invoice",
+    "Match",
+    "MatchConfig",
+    "MatchKind",
+    "MatchStatus",
+    "Payment",
+    "ReconciliationResult",
+    "__version__",
+    "reconcile",
+    "version",
+]
 
 
 def reconcile(
