@@ -174,7 +174,11 @@ def test_containers_are_fresh_copies() -> None:
     ],
 )
 def test_attributes_are_read_only(instance: object) -> None:
-    """Assigning an existing attribute or adding a new one raises AttributeError."""
+    """Assigning an existing attribute or adding a new one raises AttributeError.
+
+    Args:
+        instance: An object of one of the native classes.
+    """
     name = next(name for name in dir(instance) if not name.startswith("_"))
     with pytest.raises(AttributeError):
         setattr(instance, name, 1)
@@ -211,7 +215,11 @@ def test_invoice_and_payment_are_hashable() -> None:
     [MatchConfig(), make_match(), ReconciliationResult([], [], [])],
 )
 def test_other_types_are_unhashable(instance: object) -> None:
-    """Types that hold a dict or a list are not hashable."""
+    """Types that hold a dict or a list are not hashable.
+
+    Args:
+        instance: An object of a type that is not hashable.
+    """
     with pytest.raises(TypeError):
         hash(instance)
 
@@ -299,7 +307,11 @@ COPYABLE = [
 
 @pytest.mark.parametrize("instance", COPYABLE)
 def test_copy_and_deepcopy_give_equal_objects(instance: object) -> None:
-    """Shallow and deep copies compare equal to the original."""
+    """Shallow and deep copies compare equal to the original.
+
+    Args:
+        instance: An object of one of the native classes.
+    """
     assert copy.copy(instance) == instance
     assert copy.deepcopy(instance) == instance
 
@@ -307,7 +319,12 @@ def test_copy_and_deepcopy_give_equal_objects(instance: object) -> None:
 @pytest.mark.parametrize("instance", COPYABLE)
 @pytest.mark.parametrize("protocol", range(2, pickle.HIGHEST_PROTOCOL + 1))
 def test_pickle_round_trip(instance: object, protocol: int) -> None:
-    """Pickling and unpickling gives an equal object of the same class."""
+    """Pickling and unpickling gives an equal object of the same class.
+
+    Args:
+        instance: An object of one of the native classes.
+        protocol: The pickle protocol to use.
+    """
     restored = pickle.loads(pickle.dumps(instance, protocol=protocol))
     assert restored == instance
     assert type(restored) is type(instance)

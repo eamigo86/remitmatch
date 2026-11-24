@@ -254,7 +254,11 @@ def check(
 @settings(max_examples=300, deadline=None, database=None)
 @given(inputs())
 def test_invariants_hold_on_adversarial_inputs(data: Inputs) -> None:
-    """No id is matched twice, every id is accounted for once and groups add up."""
+    """No id is matched twice, every id is accounted for once and groups add up.
+
+    Args:
+        data: Drawn invoices, payments and configuration.
+    """
     invoices, payments, config = data
     result = reconcile(invoices, payments, config)
     check(invoices, payments, config, result)

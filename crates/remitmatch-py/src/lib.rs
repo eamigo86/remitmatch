@@ -175,6 +175,10 @@ fn reduce_fields<'py>(
 ///     due_date: Date payment is expected.
 ///     counterparty: Customer name as stored in the ledger.
 ///     scope: Partition key (company, account); different scopes never match.
+///
+/// Raises:
+///     TypeError: An argument has the wrong type.
+///     OverflowError: An integer argument is outside the accepted range.
 #[pyclass(
     frozen,
     eq,
@@ -283,6 +287,10 @@ impl PyInvoice {
 ///     reference: Free-text remittance info / description from the bank.
 ///     counterparty: Payer name as reported by the bank.
 ///     scope: Partition key; must equal the invoice scope to match.
+///
+/// Raises:
+///     TypeError: An argument has the wrong type.
+///     OverflowError: An integer argument is outside the accepted range.
 #[pyclass(
     frozen,
     eq,
@@ -383,6 +391,10 @@ impl PyPayment {
 ///     ambiguity_margin: If the best two candidates differ by less than this, flag ambiguous.
 ///     weights: Relative weight of each signal in the final score; None selects the default
 ///         weights.
+///
+/// Raises:
+///     TypeError: An argument has the wrong type.
+///     OverflowError: An integer argument is outside the accepted range.
 #[pyclass(
     frozen,
     eq,
@@ -461,7 +473,10 @@ impl PyMatchConfig {
         self.0.ambiguity_margin
     }
 
-    /// Relative weight of each signal in the final score; a new dict on each access.
+    /// Relative weight of each signal in the final score.
+    ///
+    /// Each access returns a new dict, so bind it to a variable before indexing
+    /// repeatedly.
     #[getter]
     fn weights(&self) -> BTreeMap<String, f64> {
         self.0.weights.clone()
@@ -490,7 +505,9 @@ impl PyMatchConfig {
 ///     residual_minor: Amount difference left after matching (fees, rounding).
 ///
 /// Raises:
-///     TypeError: kind or status is not a member of the matching enum.
+///     TypeError: kind or status is not a member of the matching enum, or another argument
+///         has the wrong type.
+///     OverflowError: An integer argument is outside the accepted range.
 #[pyclass(frozen, eq, from_py_object, module = "remitmatch", name = "Match")]
 #[derive(Clone, PartialEq)]
 struct PyMatch(Match);
@@ -536,12 +553,18 @@ impl PyMatch {
     }
 
     /// Payments in the match.
+    ///
+    /// Each access returns a new tuple, so bind it to a variable before indexing
+    /// repeatedly.
     #[getter]
     fn payment_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
         PyTuple::new(py, &self.0.payment_ids)
     }
 
     /// Invoices in the match.
+    ///
+    /// Each access returns a new tuple, so bind it to a variable before indexing
+    /// repeatedly.
     #[getter]
     fn invoice_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
         PyTuple::new(py, &self.0.invoice_ids)
@@ -553,7 +576,10 @@ impl PyMatch {
         self.0.score
     }
 
-    /// Per-signal scores that explain the final score; a new dict on each access.
+    /// Per-signal scores that explain the final score.
+    ///
+    /// Each access returns a new dict, so bind it to a variable before indexing
+    /// repeatedly.
     #[getter]
     fn breakdown(&self) -> BTreeMap<String, f64> {
         self.0.breakdown.clone()
@@ -582,6 +608,9 @@ impl PyMatch {
 ///     matches: Proposed matches, best score first.
 ///     unmatched_payments: Payment ids with no acceptable candidate.
 ///     unmatched_invoices: Invoice ids with no acceptable candidate.
+///
+/// Raises:
+///     TypeError: An argument has the wrong type.
 #[pyclass(
     frozen,
     eq,
@@ -607,19 +636,28 @@ impl PyReconciliationResult {
         })
     }
 
-    /// Proposed matches, best score first; a new list on each access.
+    /// Proposed matches, best score first.
+    ///
+    /// Each access returns a new list, so bind it to a variable before indexing
+    /// repeatedly.
     #[getter]
     fn matches(&self) -> Vec<PyMatch> {
         self.0.matches.iter().cloned().map(PyMatch).collect()
     }
 
-    /// Payment ids with no acceptable candidate; a new list on each access.
+    /// Payment ids with no acceptable candidate.
+    ///
+    /// Each access returns a new list, so bind it to a variable before indexing
+    /// repeatedly.
     #[getter]
     fn unmatched_payments(&self) -> Vec<String> {
         self.0.unmatched_payments.clone()
     }
 
-    /// Invoice ids with no acceptable candidate; a new list on each access.
+    /// Invoice ids with no acceptable candidate.
+    ///
+    /// Each access returns a new list, so bind it to a variable before indexing
+    /// repeatedly.
     #[getter]
     fn unmatched_invoices(&self) -> Vec<String> {
         self.0.unmatched_invoices.clone()
@@ -655,15 +693,18 @@ impl PyReconciliationResult {
 /// match. The inputs are copied before matching starts.
 ///
 /// Args:
-///     invoices: Open invoices to settle, as a list or tuple.
-///     payments: Bank movements received, as a list or tuple.
+///     invoices: Open invoices to settle, as a sequence such as a list or tuple. Any
+///         sequence except a string is accepted.
+///     payments: Bank movements received, as a sequence such as a list or tuple. Any
+///         sequence except a string is accepted.
 ///     config: Tolerances and thresholds; defaults to MatchConfig().
 ///
 /// Returns:
 ///     Matches with per-signal breakdown, plus unmatched ids on each side.
 ///
 /// Raises:
-///     ValueError: An id repeats on one side, or the config is invalid.
+///     ValueError: An id repeats on one side, the config is invalid, or the reference index
+///         cannot be built.
 ///     TypeError: An input is not a sequence of the expected objects.
 #[pyfunction]
 #[pyo3(signature = (invoices, payments, config=None))]
