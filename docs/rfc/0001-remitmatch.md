@@ -237,8 +237,8 @@ The Rust core exposes the same contract as `remitmatch::reconcile(&[Invoice], &[
 
 The engine works in passes, from safest to most expensive: whatever one pass matches is removed from the next, so the group search only sees what's still unmatched.
 
-1. **Normalize and partition.** References uppercased with spaces and dashes removed; names without accents or company suffixes (S.L., LLC, Inc.). Data is grouped by `(scope, currency)` and each partition is processed in parallel.
-2. **Reference pass.** An Aho-Corasick automaton built from the open invoice numbers finds, in a single scan, every invoice each description mentions. One invoice mentioned and the amount fits → 1:1. Several mentioned and the sum fits → 1:N. A number is not a mention when it is glued to another digit, so `INV-1` is not found inside `INV-10`; whitespace counts as a boundary. This pass does not apply the date window.
+1. **Normalize and partition.** References uppercased with spaces and dashes removed; names without accents or company suffixes (S.L., LLC, Inc.). Currency codes are compared case-insensitively. Data is grouped by `(scope, currency)` and each partition is processed in parallel.
+2. **Reference pass.** An Aho-Corasick automaton built from the open invoice numbers finds, in a single scan, every invoice each description mentions. One invoice mentioned and the amount fits → 1:1. Several mentioned and the sum fits → 1:N. A number glued to another digit is not a mention and gets no partial reference score either, so `INV-1` is not found inside `INV-10`; whitespace counts as a boundary. This pass does not apply the date window.
 3. **1:1 candidates.** An index sorted by amount returns only the invoices within tolerance; those are then filtered by date window and scored. This avoids comparing everything against everything. Fuzzy reference similarity is not used for a payment whose reference already names an open invoice exactly.
 4. **1:N groups.** For each unmatched payment: open invoices from the same counterparty (name above the threshold) and within the window. The engine looks for a subset whose sum equals the payment amount ± tolerance, with at most `max_group_size` invoices.
    1. It's a *subset-sum* variant: bounded by a maximum number of candidates (e.g. 24) and solved with *meet-in-the-middle*; if there are more, the oldest invoices take priority.
@@ -349,6 +349,9 @@ If week 4 runs long, 0.1.0 ships with 1:1 and 1:N only, and N:1 moves to 0.2.0.
 - [x] Reserve the name by publishing an empty 0.0.1 on PyPI and crates.io (done 2026-11-24)
 - [ ] Default scoring weights: tune them with the generator data. With the current defaults, a payment without a reference signal can score at most 0.55, below the 0.60 suggest threshold, and an amount at the tolerance limit scores 0
 - [ ] Percentage amount tolerance is listed in Scope v1, but `MatchConfig` has no field for it yet
+- [ ] Decide whether a match with only a partial (misspelled) reference may be `auto` or must stay `suggested`; today it can be `auto` when the other signals are strong (for example invoice INV-2024-001 and reference INV-2024-010)
+- [ ] Short or purely numeric invoice numbers (for example 7 or 100) can be found inside unrelated text such as an amount, and an exact amount plus a close date is then enough for `auto`
+- [ ] The candidate pass scores every same-amount pair and the partial reference search is unoptimized (about 66 microseconds per pair); address it in the benchmarks milestone
 - [ ] Candidate limit for the group search (24 is an initial estimate)
 - [x] License: MIT OR Apache-2.0 (dual, as is common in Rust)
 
