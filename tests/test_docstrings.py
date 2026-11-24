@@ -56,3 +56,48 @@ def test_public_objects_are_documented_in_plain_text() -> None:
             if not doc.strip() or "`" in doc:
                 missing.append(label)
     assert not missing, missing
+
+
+def _public_stub_items(
+    body: list[ast.stmt], prefix: str
+) -> dict[str, ast.ClassDef | ast.FunctionDef]:
+    """Collect the public documented definitions of a stub body.
+
+    Args:
+        body: Statements of a module or class in a stub.
+        prefix: Dotted path of the owner, empty for the module.
+
+    Returns:
+        Definitions keyed by dotted name, with nested class members included.
+    """
+    items: dict[str, ast.ClassDef | ast.FunctionDef] = {}
+    for node in body:
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and not node.name.startswith("_"):
+            items[prefix + node.name] = node
+            if isinstance(node, ast.ClassDef):
+                items.update(_public_stub_items(node.body, f"{prefix}{node.name}."))
+    return items
+
+
+def test_stub_docstrings_equal_runtime_docstrings() -> None:
+    """Each public stub item has the runtime docstring, and no runtime item lacks a stub."""
+    tree = ast.parse((ROOT / "python" / "remitmatch" / "_core.pyi").read_text(encoding="utf-8"))
+    items = _public_stub_items(tree.body, "")
+    assert inspect.cleandoc(ast.get_docstring(tree, clean=False) or "") == inspect.cleandoc(
+        _core.__doc__ or ""
+    )
+    problems = []
+    for name, node in items.items():
+        target: object = _core
+        for part in name.split("."):
+            target = vars(target)[part] if inspect.isclass(target) else getattr(target, part)
+        stub_doc = inspect.cleandoc(ast.get_docstring(node, clean=False) or "")
+        if not stub_doc or stub_doc != inspect.cleandoc(getattr(target, "__doc__", None) or ""):
+            problems.append(f"docstring differs: {name}")
+    runtime_names = {n for n in vars(_core) if not n.startswith("_")}
+    for class_name in {n for n in items if "." not in n and inspect.isclass(getattr(_core, n))}:
+        runtime_names |= {
+            f"{class_name}.{n}" for n in vars(getattr(_core, class_name)) if not n.startswith("_")
+        }
+    problems += [f"missing from stub: {n}" for n in sorted(runtime_names - set(items))]
+    assert not problems, problems
