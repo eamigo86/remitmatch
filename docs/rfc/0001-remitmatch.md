@@ -340,7 +340,7 @@ If week 4 runs long, 0.1.0 ships with 1:1 and 1:N only, and N:1 moves to 0.2.0.
 
 **Open decisions**
 
-- [ ] Reserve the name by publishing an empty 0.0.1 on PyPI and crates.io
+- [x] Reserve the name by publishing an empty 0.0.1 on PyPI and crates.io (done 2026-11-24)
 - [ ] Default scoring weights: tune them with the generator data
 - [ ] Candidate limit for the group search (24 is an initial estimate)
 - [x] License: MIT OR Apache-2.0 (dual, as is common in Rust)
