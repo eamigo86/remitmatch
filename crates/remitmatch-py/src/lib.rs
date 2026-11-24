@@ -1,8 +1,18 @@
 //! PyO3 bindings for remitmatch. Exposes the native module `_core`.
 //!
 //! The bindings only convert types: Python values are copied into the core structs and the
-//! core results are copied back. The classes are frozen, so they can be shared between
-//! threads without a lock. All matching logic lives in the `remitmatch` crate.
+//! core results are copied back. All matching logic lives in the `remitmatch` crate.
+//!
+//! - `Invoice`, `Payment`, `MatchConfig`, `Match` and `ReconciliationResult` are frozen
+//!   classes that wrap the core structs, so they are shared between threads without a lock.
+//!   Dates are `datetime.date`, amounts are Python `int` in minor units.
+//! - `MatchKind` and `MatchStatus` are plain Python enums in `remitmatch._enums`; the native
+//!   code imports them on first use and converts through their string values.
+//! - `reconcile` copies its inputs, releases the GIL while the core runs and maps
+//!   [`remitmatch::Error`] to `ValueError`. Inputs that are not sequences of the expected
+//!   classes raise `TypeError` during argument conversion.
+//! - Docstrings on the Python-facing items follow the Python documentation rules of the
+//!   project (Google style, no backticks), because they become `__doc__`.
 
 use std::collections::BTreeMap;
 

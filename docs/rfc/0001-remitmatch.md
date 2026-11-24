@@ -225,9 +225,18 @@ def reconcile(
 
     Raises:
         ValueError: An id repeats on one side, or the config is invalid.
+        TypeError: An input is not a sequence of the expected objects.
     """
     ...
 ```
+
+Implementation notes for the Python API as shipped on the development branch:
+
+- The dataclass notation above documents the fields, their order and their defaults. The runtime types are native classes (`#[pyclass(frozen)]`), not dataclasses: they take positional or keyword arguments, expose read-only attributes, compare field by field, and `Invoice` and `Payment` are hashable. `MatchConfig`, `Match` and `ReconciliationResult` are not hashable, as a frozen dataclass holding a dict or list would not be. The `dataclasses` helpers (`fields`, `replace`, `asdict`) and pickling are not supported.
+- `MatchKind` and `MatchStatus` are real `enum.Enum` classes defined in Python; `Match.kind` and `Match.status` return their members. `MatchConfig.weights=None` selects the default weights.
+- `MatchConfig.weights` and `Match.breakdown` return a new `dict` on each access, `Match.payment_ids` and `Match.invoice_ids` are tuples, and the lists of a `ReconciliationResult` are new lists on each access.
+- `reconcile` accepts sequences (lists or tuples) of `Invoice` and `Payment` objects, copies them into core structs and runs the core with the GIL released. Errors from the core surface as `ValueError` with the core message (repeated ids, invalid configuration, reference index); an input that is not a sequence of the expected objects raises `TypeError`; an integer that does not fit the native type (for example a negative `date_window_days`) raises `OverflowError`.
+- `ReconciliationResult.to_arrow()` exists and raises `NotImplementedError`; Arrow table input and Arrow output arrive in a later change, together with the choice between `pyarrow` and `arrow-rs` through the PyCapsule interface.
 
 Usage example: `result = reconcile(invoices, payments, MatchConfig(amount_tolerance_minor=150))`.
 

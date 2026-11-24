@@ -1,6 +1,10 @@
 """Match bank payments to open invoices and explain every match.
 
-Version 0.0.1 reserves the package name. The matching engine is planned for 0.1.0.
+Build Invoice and Payment objects, with amounts as integers in minor units, and pass lists of
+them to reconcile. It returns a ReconciliationResult whose Match objects carry the kind
+(1:1, 1:N or N:1), the status, the score and a per-signal breakdown, plus the ids left
+unmatched. All types are immutable. The published 0.0.1 only reserves the package name;
+matching is available from the development branch.
 """
 
 from remitmatch._core import (
