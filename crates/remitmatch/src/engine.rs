@@ -37,13 +37,29 @@ enum Anchor {
     Invoice(usize),
 }
 
+/// The rows of one side of a candidate; a single row needs no allocation.
+enum Members {
+    One(usize),
+    Many(Vec<usize>),
+}
+
+impl Members {
+    /// Returns the input indices, ascending.
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            Self::One(row) => std::slice::from_ref(row),
+            Self::Many(rows) => rows,
+        }
+    }
+}
+
 /// A scored set of payments and invoices that has not been assigned yet.
 ///
-/// Both lists are non-empty and hold ascending input indices; one of them has one entry.
+/// Both sides are non-empty and hold ascending input indices; one of them has one entry.
 struct Candidate {
     anchor: Anchor,
-    payments: Vec<usize>,
-    invoices: Vec<usize>,
+    payments: Members,
+    invoices: Members,
     score: f64,
     signals: Signals,
     /// The group was searched in a pool cut to [`GROUP_CANDIDATE_LIMIT`] rows.
@@ -53,7 +69,7 @@ struct Candidate {
 impl Candidate {
     /// Returns whether the candidate links more than one payment or more than one invoice.
     fn is_group(&self) -> bool {
-        self.payments.len() + self.invoices.len() > 2
+        self.payments.as_slice().len() + self.invoices.as_slice().len() > 2
     }
 }
 
@@ -299,17 +315,18 @@ impl Engine<'_> {
     fn candidate(
         &self,
         anchor: Anchor,
-        payments: Vec<usize>,
-        invoices: Vec<usize>,
+        payments: Members,
+        invoices: Members,
         reference: f64,
         truncated: bool,
     ) -> Candidate {
+        let (pay_rows, inv_rows) = (payments.as_slice(), invoices.as_slice());
         let diff = self
-            .payment_total(&payments)
-            .abs_diff(self.invoice_total(&invoices));
+            .payment_total(pay_rows)
+            .abs_diff(self.invoice_total(inv_rows));
         let (mut name, mut date) = (1.0_f64, 0.0_f64);
-        for &p in &payments {
-            for &i in &invoices {
+        for &p in pay_rows {
+            for &i in inv_rows {
                 name = name.min(name_signal(&self.payment_name[p], &self.invoice_name[i]));
                 date += date_signal(
                     self.payments[p].value_date,
@@ -326,7 +343,7 @@ impl Engine<'_> {
                 self.config.amount_tolerance_minor,
             ),
             name,
-            date: date / (payments.len() * invoices.len()) as f64,
+            date: date / (pay_rows.len() * inv_rows.len()) as f64,
         };
         Candidate {
             anchor,
@@ -419,8 +436,8 @@ impl Engine<'_> {
                 if diff <= self.tolerance {
                     candidates.push(self.candidate(
                         Anchor::Payment(p),
-                        vec![p],
-                        vec![i],
+                        Members::One(p),
+                        Members::One(i),
                         1.0,
                         false,
                     ));
@@ -435,7 +452,13 @@ impl Engine<'_> {
                 self.payments[p].amount_minor,
             );
             for group in groups {
-                let c = self.candidate(Anchor::Payment(p), vec![p], group, 1.0, truncated);
+                let c = self.candidate(
+                    Anchor::Payment(p),
+                    Members::One(p),
+                    Members::Many(group),
+                    1.0,
+                    truncated,
+                );
                 candidates.push(c);
             }
             all_mentions.insert(p, mentioned);
@@ -469,7 +492,13 @@ impl Engine<'_> {
                 self.invoices[i].amount_minor,
             );
             for group in groups {
-                let c = self.candidate(Anchor::Invoice(i), group, vec![i], 1.0, truncated);
+                let c = self.candidate(
+                    Anchor::Invoice(i),
+                    Members::Many(group),
+                    Members::One(i),
+                    1.0,
+                    truncated,
+                );
                 candidates.push(c);
             }
         }
@@ -506,8 +535,8 @@ impl Engine<'_> {
                 };
                 self.candidate(
                     Anchor::Payment(payment),
-                    vec![payment],
-                    vec![i],
+                    Members::One(payment),
+                    Members::One(i),
                     reference,
                     false,
                 )
@@ -571,7 +600,13 @@ impl Engine<'_> {
                 self.fitting_groups(&pool, |i| self.invoices[i].amount_minor, pay.amount_minor);
             for group in groups {
                 let reference = self.mention_share(mentions, &[p], &group);
-                let c = self.candidate(Anchor::Payment(p), vec![p], group, reference, truncated);
+                let c = self.candidate(
+                    Anchor::Payment(p),
+                    Members::One(p),
+                    Members::Many(group),
+                    reference,
+                    truncated,
+                );
                 candidates.push(c);
             }
             self.assign(candidates, state);
@@ -622,7 +657,13 @@ impl Engine<'_> {
                 self.fitting_groups(&pool, |p| self.payments[p].amount_minor, inv.amount_minor);
             for group in groups {
                 let reference = self.mention_share(mentions, &group, &[i]);
-                let c = self.candidate(Anchor::Invoice(i), group, vec![i], reference, truncated);
+                let c = self.candidate(
+                    Anchor::Invoice(i),
+                    Members::Many(group),
+                    Members::One(i),
+                    reference,
+                    truncated,
+                );
                 candidates.push(c);
             }
             self.assign(candidates, state);
@@ -658,21 +699,32 @@ impl Engine<'_> {
         candidates.sort_by(|a, b| {
             b.score
                 .total_cmp(&a.score)
-                .then_with(|| a.payments.first().cmp(&b.payments.first()))
-                .then_with(|| a.invoices.first().cmp(&b.invoices.first()))
-                .then_with(|| a.payments.cmp(&b.payments))
-                .then_with(|| a.invoices.cmp(&b.invoices))
+                .then_with(|| {
+                    a.payments
+                        .as_slice()
+                        .first()
+                        .cmp(&b.payments.as_slice().first())
+                })
+                .then_with(|| {
+                    a.invoices
+                        .as_slice()
+                        .first()
+                        .cmp(&b.invoices.as_slice().first())
+                })
+                .then_with(|| a.payments.as_slice().cmp(b.payments.as_slice()))
+                .then_with(|| a.invoices.as_slice().cmp(b.invoices.as_slice()))
         });
         for c in candidates {
-            if c.payments.iter().any(|&p| state.payment_taken[p])
-                || c.invoices.iter().any(|&i| state.invoice_taken[i])
+            let (pay_rows, inv_rows) = (c.payments.as_slice(), c.invoices.as_slice());
+            if pay_rows.iter().any(|&p| state.payment_taken[p])
+                || inv_rows.iter().any(|&i| state.invoice_taken[i])
             {
                 continue;
             }
-            for &p in &c.payments {
+            for &p in pay_rows {
                 state.payment_taken[p] = true;
             }
-            for &i in &c.invoices {
+            for &i in inv_rows {
                 state.invoice_taken[i] = true;
             }
             let (first, second) = top_two[&c.anchor];
@@ -685,27 +737,25 @@ impl Engine<'_> {
             } else {
                 MatchStatus::Suggested
             };
-            let kind = match (c.payments.len(), c.invoices.len()) {
+            let kind = match (pay_rows.len(), inv_rows.len()) {
                 (1, 1) => MatchKind::OneToOne,
                 (1, _) => MatchKind::OneToMany,
                 _ => MatchKind::ManyToOne,
             };
             // The difference is within the tolerance, which is a non-negative i64.
             let residual =
-                i64::try_from(self.payment_total(&c.payments) - self.invoice_total(&c.invoices))
+                i64::try_from(self.payment_total(pay_rows) - self.invoice_total(inv_rows))
                     .unwrap_or_default();
             state.found.push((
-                c.payments.first().copied().unwrap_or_default(),
+                pay_rows.first().copied().unwrap_or_default(),
                 Match {
                     kind,
                     status,
-                    payment_ids: c
-                        .payments
+                    payment_ids: pay_rows
                         .iter()
                         .map(|&p| self.payments[p].id.clone())
                         .collect(),
-                    invoice_ids: c
-                        .invoices
+                    invoice_ids: inv_rows
                         .iter()
                         .map(|&i| self.invoices[i].id.clone())
                         .collect(),
