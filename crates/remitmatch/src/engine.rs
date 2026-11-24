@@ -22,6 +22,9 @@ const SIGNALS: [&str; 4] = ["reference", "amount", "name", "date"];
 /// Input indices of the invoices and payments of one partition.
 type PartitionRows = (Vec<usize>, Vec<usize>);
 
+/// Minimum name signal for a row to enter the pool of a counterparty group search.
+const GROUP_NAME_THRESHOLD: f64 = 0.85;
+
 /// Invoices each payment of a partition mentions exactly, by input index.
 type Mentions = HashMap<usize, BTreeSet<usize>>;
 
@@ -230,7 +233,8 @@ impl Engine<'_> {
         partitions
     }
 
-    /// Runs the reference passes and then the 1:1 candidate pass on one partition.
+    /// Runs the reference passes, the 1:1 candidate pass and the counterparty group passes
+    /// on one partition.
     fn run_partition(
         &self,
         invoice_rows: &[usize],
@@ -257,7 +261,18 @@ impl Engine<'_> {
             .flat_map(|&p| self.window_candidates(p, &open, mentions.contains_key(&p)))
             .collect();
         self.assign(candidates, state);
+
+        let candidates = self.invoice_groups_by_name(invoice_rows, payment_rows, &mentions, state);
+        self.assign(candidates, state);
+        let candidates = self.payment_groups_by_name(invoice_rows, payment_rows, &mentions, state);
+        self.assign(candidates, state);
         Ok(())
+    }
+
+    /// Returns whether two dates are at most `date_window_days` apart.
+    fn within_window(&self, a: NaiveDate, b: NaiveDate) -> bool {
+        a.signed_duration_since(b).num_days().unsigned_abs()
+            <= u64::from(self.config.date_window_days)
     }
 
     /// Sums the amounts of the given payments.
@@ -463,14 +478,7 @@ impl Engine<'_> {
         let end = open.partition_point(|&(amount, _)| amount <= high);
         open[start..end]
             .iter()
-            .filter(|&&(_, i)| {
-                let days = pay
-                    .value_date
-                    .signed_duration_since(self.invoices[i].due_date)
-                    .num_days()
-                    .unsigned_abs();
-                days <= u64::from(self.config.date_window_days)
-            })
+            .filter(|&&(_, i)| self.within_window(pay.value_date, self.invoices[i].due_date))
             .map(|&(_, i)| {
                 let reference = if explained {
                     0.0
@@ -483,6 +491,108 @@ impl Engine<'_> {
                 self.candidate(Anchor::Payment(payment), vec![payment], vec![i], reference)
             })
             .collect()
+    }
+
+    /// Returns the share of payment-invoice pairs where the payment names the invoice exactly.
+    fn mention_share(&self, mentions: &Mentions, payments: &[usize], invoices: &[usize]) -> f64 {
+        let named = payments
+            .iter()
+            .flat_map(|&p| invoices.iter().map(move |&i| (p, i)))
+            .filter(|&(p, i)| mentions.get(&p).is_some_and(|set| set.contains(&i)))
+            .count();
+        named as f64 / (payments.len() * invoices.len()) as f64
+    }
+
+    /// Builds the 1:N candidates of each open payment from its counterparty's open invoices.
+    ///
+    /// The pool holds the open invoices whose name reaches [`GROUP_NAME_THRESHOLD`], that fall
+    /// inside the date window and that do not exceed the payment plus the tolerance. The
+    /// reference signal is the share of pairs the payment names exactly.
+    fn invoice_groups_by_name(
+        &self,
+        invoice_rows: &[usize],
+        payment_rows: &[usize],
+        mentions: &Mentions,
+        state: &Assigned,
+    ) -> Vec<Candidate> {
+        let invoices = by_name(invoice_rows, &state.invoice_taken, &self.invoice_name);
+        let payments: Vec<usize> = payment_rows
+            .iter()
+            .copied()
+            .filter(|&p| !state.payment_taken[p])
+            .collect();
+        let names = payments.iter().map(|&p| self.payment_name[p].as_str());
+        let similar = similar_buckets(names, &invoices);
+        let mut candidates = Vec::new();
+        for p in payments {
+            let pay = &self.payments[p];
+            let limit = i128::from(pay.amount_minor) + i128::from(self.tolerance);
+            let pool = similar
+                .get(self.payment_name[p].as_str())
+                .into_iter()
+                .flatten()
+                .flat_map(|rows| rows.iter().copied())
+                .filter(|&i| {
+                    let inv = &self.invoices[i];
+                    i128::from(inv.amount_minor) <= limit
+                        && self.within_window(pay.value_date, inv.due_date)
+                })
+                .collect();
+            let pool = oldest(pool, |i| self.invoices[i].due_date);
+            for group in
+                self.fitting_groups(&pool, |i| self.invoices[i].amount_minor, pay.amount_minor)
+            {
+                let reference = self.mention_share(mentions, &[p], &group);
+                candidates.push(self.candidate(Anchor::Payment(p), vec![p], group, reference));
+            }
+        }
+        candidates
+    }
+
+    /// Builds the N:1 candidates of each open invoice from its counterparty's open payments.
+    ///
+    /// Mirror of [`Self::invoice_groups_by_name`]: the pool holds the open payments whose
+    /// name reaches [`GROUP_NAME_THRESHOLD`], inside the date window and not above the
+    /// invoice plus the tolerance.
+    fn payment_groups_by_name(
+        &self,
+        invoice_rows: &[usize],
+        payment_rows: &[usize],
+        mentions: &Mentions,
+        state: &Assigned,
+    ) -> Vec<Candidate> {
+        let payments = by_name(payment_rows, &state.payment_taken, &self.payment_name);
+        let invoices: Vec<usize> = invoice_rows
+            .iter()
+            .copied()
+            .filter(|&i| !state.invoice_taken[i])
+            .collect();
+        let names = invoices.iter().map(|&i| self.invoice_name[i].as_str());
+        let similar = similar_buckets(names, &payments);
+        let mut candidates = Vec::new();
+        for i in invoices {
+            let inv = &self.invoices[i];
+            let limit = i128::from(inv.amount_minor) + i128::from(self.tolerance);
+            let pool = similar
+                .get(self.invoice_name[i].as_str())
+                .into_iter()
+                .flatten()
+                .flat_map(|rows| rows.iter().copied())
+                .filter(|&p| {
+                    let pay = &self.payments[p];
+                    i128::from(pay.amount_minor) <= limit
+                        && self.within_window(pay.value_date, inv.due_date)
+                })
+                .collect();
+            let pool = oldest(pool, |p| self.payments[p].value_date);
+            for group in
+                self.fitting_groups(&pool, |p| self.payments[p].amount_minor, inv.amount_minor)
+            {
+                let reference = self.mention_share(mentions, &group, &[i]);
+                candidates.push(self.candidate(Anchor::Invoice(i), group, vec![i], reference));
+            }
+        }
+        candidates
     }
 
     /// Greedily accepts the best candidates whose payments and invoices are all free.
@@ -570,6 +680,42 @@ impl Engine<'_> {
             ));
         }
     }
+}
+
+/// Buckets the free rows by normalized name, keeping input order inside each bucket.
+fn by_name<'a>(
+    rows: &[usize],
+    taken: &[bool],
+    names: &'a [String],
+) -> BTreeMap<&'a str, Vec<usize>> {
+    let mut buckets: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for &row in rows.iter().filter(|&&r| !taken[r]) {
+        buckets.entry(names[row].as_str()).or_default().push(row);
+    }
+    buckets
+}
+
+/// Finds, for each distinct anchor name, the buckets whose name reaches the threshold.
+///
+/// Names are compared once per distinct pair, not once per row pair.
+// ponytail: distinct anchor names x distinct bucket names Jaro-Winkler comparisons per
+// partition. Upgrade: block the names (first letters or n-grams) before comparing if a
+// partition holds tens of thousands of distinct names.
+fn similar_buckets<'a, 'b>(
+    anchor_names: impl Iterator<Item = &'a str>,
+    buckets: &'b BTreeMap<&str, Vec<usize>>,
+) -> HashMap<&'a str, Vec<&'b Vec<usize>>> {
+    let mut similar: HashMap<&str, Vec<&Vec<usize>>> = HashMap::new();
+    for name in anchor_names {
+        similar.entry(name).or_insert_with(|| {
+            buckets
+                .iter()
+                .filter(|&(&other, _)| meets(name_signal(name, other), GROUP_NAME_THRESHOLD))
+                .map(|(_, rows)| rows)
+                .collect()
+        });
+    }
+    similar
 }
 
 /// Orders rows by date and then input index, so a truncated pool keeps the oldest rows.
