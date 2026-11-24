@@ -46,6 +46,8 @@ struct Candidate {
     invoices: Vec<usize>,
     score: f64,
     signals: Signals,
+    /// The group was searched in a pool cut to [`GROUP_CANDIDATE_LIMIT`] rows.
+    truncated: bool,
 }
 
 impl Candidate {
@@ -292,13 +294,15 @@ impl Engine<'_> {
     /// Scores a set of payments against a set of invoices with the given reference signal.
     ///
     /// The amount signal reads the difference of the two totals; the name signal is the
-    /// minimum and the date signal the mean over every payment-invoice pair.
+    /// minimum and the date signal the mean over every payment-invoice pair. `truncated`
+    /// marks a group found in a pool that had to be cut.
     fn candidate(
         &self,
         anchor: Anchor,
         payments: Vec<usize>,
         invoices: Vec<usize>,
         reference: f64,
+        truncated: bool,
     ) -> Candidate {
         let diff = self
             .payment_total(&payments)
@@ -330,6 +334,7 @@ impl Engine<'_> {
             invoices,
             score: weighted_score(&signals, &self.weights),
             signals,
+            truncated,
         }
     }
 
@@ -337,20 +342,22 @@ impl Engine<'_> {
     ///
     /// `amount` reads a row's amount. Each subset lists ascending input indices; at most
     /// `max_group_size` rows per subset, none when that is below 2. Only the first
-    /// [`GROUP_CANDIDATE_LIMIT`] rows are searched, so the caller orders them by priority.
+    /// [`GROUP_CANDIDATE_LIMIT`] rows are searched, so the caller orders them by priority;
+    /// the flag says whether rows were left out, which makes the search incomplete.
     fn fitting_groups(
         &self,
         rows: &[usize],
         amount: impl Fn(usize) -> i64,
         target: i64,
-    ) -> Vec<Vec<usize>> {
+    ) -> (Vec<Vec<usize>>, bool) {
         let max_size = self.config.max_group_size;
         if max_size < 2 {
-            return Vec::new();
+            return (Vec::new(), false);
         }
+        let truncated = rows.len() > GROUP_CANDIDATE_LIMIT;
         let rows = &rows[..rows.len().min(GROUP_CANDIDATE_LIMIT)];
         let amounts: Vec<i64> = rows.iter().map(|&r| amount(r)).collect();
-        find_subsets(
+        let groups = find_subsets(
             &amounts,
             target,
             self.tolerance,
@@ -363,7 +370,8 @@ impl Engine<'_> {
             group.sort_unstable();
             group
         })
-        .collect()
+        .collect();
+        (groups, truncated)
     }
 
     /// Finds the invoices each payment mentions exactly, in one scan per payment.
@@ -409,18 +417,26 @@ impl Engine<'_> {
                     .amount_minor
                     .abs_diff(self.invoices[i].amount_minor);
                 if diff <= self.tolerance {
-                    candidates.push(self.candidate(Anchor::Payment(p), vec![p], vec![i], 1.0));
+                    candidates.push(self.candidate(
+                        Anchor::Payment(p),
+                        vec![p],
+                        vec![i],
+                        1.0,
+                        false,
+                    ));
                 }
             }
             let pool = oldest(mentioned.iter().copied().collect(), |i| {
                 self.invoices[i].due_date
             });
-            for group in self.fitting_groups(
+            let (groups, truncated) = self.fitting_groups(
                 &pool,
                 |i| self.invoices[i].amount_minor,
                 self.payments[p].amount_minor,
-            ) {
-                candidates.push(self.candidate(Anchor::Payment(p), vec![p], group, 1.0));
+            );
+            for group in groups {
+                let c = self.candidate(Anchor::Payment(p), vec![p], group, 1.0, truncated);
+                candidates.push(c);
             }
             all_mentions.insert(p, mentioned);
         }
@@ -447,12 +463,14 @@ impl Engine<'_> {
         let mut candidates = Vec::new();
         for (i, payments) in naming {
             let pool = oldest(payments, |p| self.payments[p].value_date);
-            for group in self.fitting_groups(
+            let (groups, truncated) = self.fitting_groups(
                 &pool,
                 |p| self.payments[p].amount_minor,
                 self.invoices[i].amount_minor,
-            ) {
-                candidates.push(self.candidate(Anchor::Invoice(i), group, vec![i], 1.0));
+            );
+            for group in groups {
+                let c = self.candidate(Anchor::Invoice(i), group, vec![i], 1.0, truncated);
+                candidates.push(c);
             }
         }
         candidates
@@ -486,7 +504,13 @@ impl Engine<'_> {
                         &self.payment_reference[payment].text,
                     )
                 };
-                self.candidate(Anchor::Payment(payment), vec![payment], vec![i], reference)
+                self.candidate(
+                    Anchor::Payment(payment),
+                    vec![payment],
+                    vec![i],
+                    reference,
+                    false,
+                )
             })
             .collect()
     }
@@ -543,11 +567,12 @@ impl Engine<'_> {
                 })
                 .collect();
             let pool = oldest(pool, |i| self.invoices[i].due_date);
-            for group in
-                self.fitting_groups(&pool, |i| self.invoices[i].amount_minor, pay.amount_minor)
-            {
+            let (groups, truncated) =
+                self.fitting_groups(&pool, |i| self.invoices[i].amount_minor, pay.amount_minor);
+            for group in groups {
                 let reference = self.mention_share(mentions, &[p], &group);
-                candidates.push(self.candidate(Anchor::Payment(p), vec![p], group, reference));
+                let c = self.candidate(Anchor::Payment(p), vec![p], group, reference, truncated);
+                candidates.push(c);
             }
             self.assign(candidates, state);
         }
@@ -593,11 +618,12 @@ impl Engine<'_> {
                 })
                 .collect();
             let pool = oldest(pool, |p| self.payments[p].value_date);
-            for group in
-                self.fitting_groups(&pool, |p| self.payments[p].amount_minor, inv.amount_minor)
-            {
+            let (groups, truncated) =
+                self.fitting_groups(&pool, |p| self.payments[p].amount_minor, inv.amount_minor);
+            for group in groups {
                 let reference = self.mention_share(mentions, &group, &[i]);
-                candidates.push(self.candidate(Anchor::Invoice(i), group, vec![i], reference));
+                let c = self.candidate(Anchor::Invoice(i), group, vec![i], reference, truncated);
+                candidates.push(c);
             }
             self.assign(candidates, state);
         }
@@ -607,8 +633,9 @@ impl Engine<'_> {
     ///
     /// A match is ambiguous when its anchor's two best candidates in this pass (any score,
     /// taken or not) are closer than the ambiguity margin, or when it is a group and its
-    /// anchor had more than one fitting group in this pass. A lone candidate is never
-    /// ambiguous by the margin rule.
+    /// anchor had more than one fitting group in this pass, or when its group came from a
+    /// pool cut to [`GROUP_CANDIDATE_LIMIT`] rows (the search was incomplete). A lone
+    /// candidate is never ambiguous by the margin rule.
     fn assign(&self, mut candidates: Vec<Candidate>, state: &mut Assigned) {
         let config = self.config;
         let mut top_two: HashMap<Anchor, (f64, f64)> = HashMap::new();
@@ -650,7 +677,8 @@ impl Engine<'_> {
             }
             let (first, second) = top_two[&c.anchor];
             let several_groups = c.is_group() && groups_per_anchor.get(&c.anchor) > Some(&1);
-            let status = if first - second + EPS < config.ambiguity_margin || several_groups {
+            let unsure = several_groups || c.truncated;
+            let status = if first - second + EPS < config.ambiguity_margin || unsure {
                 MatchStatus::Ambiguous
             } else if meets(c.score, config.auto_threshold) {
                 MatchStatus::Auto

@@ -1030,3 +1030,49 @@ fn counterparty_invoice_anchors_choose_among_the_payments_still_free() {
     assert!(r.matches.iter().all(|m| m.kind == MatchKind::ManyToOne));
     assert!(r.unmatched_payments.is_empty() && r.unmatched_invoices.is_empty());
 }
+
+#[test]
+fn a_group_from_a_truncated_pool_is_never_auto() {
+    // I00, I01, I28 and I29 are 1000 each; the rest are distinct small amounts. Only the 24
+    // oldest invoices are searched, so I28 + I29 is out of reach and the answer is unsure.
+    let invoices: Vec<Invoice> = (0..30)
+        .map(|k| {
+            let amount = if [0, 1, 28, 29].contains(&k) {
+                1_000
+            } else {
+                100 + k
+            };
+            inv(&format!("I{k:02}"), &format!("INV-{k:02}"), amount)
+        })
+        .collect();
+    let r = run(
+        &invoices,
+        &[pay("p1", 2_000, "thanks")],
+        &no_reference_config(),
+    );
+    assert_eq!(r.matches.len(), 1);
+    assert_eq!(r.matches[0].kind, MatchKind::OneToMany);
+    assert_eq!(r.matches[0].invoice_ids, vec!["I00", "I01"]);
+    assert_eq!(r.matches[0].status, MatchStatus::Ambiguous);
+}
+
+#[test]
+fn a_truncated_mention_pool_is_never_auto() {
+    let config = MatchConfig {
+        max_group_size: 24,
+        ..MatchConfig::default()
+    };
+    let identical = |count: usize| -> Vec<Invoice> {
+        (0..count)
+            .map(|k| inv(&format!("i{k:02}"), "INV-7", 100))
+            .collect()
+    };
+    let r = run(&identical(30), &[pay("p1", 2_400, "INV-7")], &config);
+    assert_eq!(r.matches.len(), 1);
+    assert_eq!(r.matches[0].invoice_ids.len(), 24);
+    assert_eq!(r.matches[0].status, MatchStatus::Ambiguous);
+    // Exactly 24 mentioned invoices fit the cap: one subset, nothing was left out.
+    let r = run(&identical(24), &[pay("p1", 2_400, "INV-7")], &config);
+    assert_eq!(r.matches.len(), 1);
+    assert_eq!(r.matches[0].status, MatchStatus::Auto);
+}
