@@ -1,14 +1,14 @@
 //! Matches bank payments to open invoices and explains every match.
 //!
-//! The entry point is [`reconcile`], which pairs each [`Payment`] with at most one
-//! [`Invoice`] (1:1 matching) and returns a [`ReconciliationResult`]. Every [`Match`]
-//! carries a per-signal `breakdown` that explains its score. Grouped matches (1:N and
-//! N:1) are planned for later releases.
+//! The entry point is [`reconcile`], which pairs [`Payment`]s with [`Invoice`]s (1:1, 1:N
+//! and N:1) and returns a [`ReconciliationResult`]. Every [`Match`] carries a per-signal
+//! `breakdown` that explains its score.
 //!
-//! Matching works in two passes. The reference pass looks for invoice numbers inside the
-//! payment reference; the candidate pass scores the invoices whose amount is within
-//! tolerance and whose due date is inside the date window. Payments and invoices only
-//! match inside the same scope and currency.
+//! The reference passes look for invoice numbers inside the payment reference: a payment
+//! that names several invoices whose amounts add up is a 1:N match, and several payments
+//! that name one invoice and add up to it are an N:1 match. The candidate pass scores the
+//! invoices whose amount is within tolerance and whose due date is inside the date window.
+//! Payments and invoices only match inside the same scope and currency.
 //!
 //! All monetary amounts are integers in minor units (for example cents), never
 //! floating-point numbers.
@@ -82,7 +82,7 @@ pub struct MatchConfig {
     pub amount_tolerance_minor: i64,
     /// Maximum number of days between due date and value date.
     pub date_window_days: u32,
-    /// Maximum invoices (1:N) or payments (N:1) in one group.
+    /// Maximum invoices (1:N) or payments (N:1) in one group; below 2 disables groups.
     pub max_group_size: usize,
     /// Score at or above which a match is accepted automatically.
     pub auto_threshold: f64,
@@ -197,12 +197,16 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Matches payments to open invoices one to one and explains every match.
+/// Matches payments to open invoices and explains every match.
 ///
-/// Each invoice and each payment appears in at most one [`Match`]. Rows whose amount is
-/// not positive never match. Payments and invoices only match inside the same scope and
-/// currency (compared case-insensitively). Weights missing from
-/// [`MatchConfig::weights`] count as zero, and `max_group_size` is not used yet.
+/// Each invoice and each payment appears in at most one [`Match`]. A match is one to one,
+/// one payment for several invoices, or several payments for one invoice, as named in
+/// [`MatchKind`]; a group never exceeds [`MatchConfig::max_group_size`], and a value below
+/// 2 disables groups. A group is only proposed when the payments add up to the invoices
+/// within [`MatchConfig::amount_tolerance_minor`], applied once to the group total. Rows
+/// whose amount is not positive never match. Payments and invoices only match inside the
+/// same scope and currency (compared case-insensitively). Weights missing from
+/// [`MatchConfig::weights`] count as zero.
 ///
 /// # Errors
 ///

@@ -1,8 +1,4 @@
 //! Bounded subset-sum search used by the group passes.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the engine in a later commit")
-)]
 
 /// Most amounts the search looks at; each half then has at most 4,096 subsets.
 pub(crate) const GROUP_CANDIDATE_LIMIT: usize = 24;
