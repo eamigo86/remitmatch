@@ -50,7 +50,18 @@ def reconcile(
 
 @final
 class Invoice:
-    """An open receivable that payments can settle."""
+    """An open receivable that payments can settle.
+
+    Args:
+        id: Unique invoice identifier in the caller's system.
+        number: Human-facing invoice number searched for in payment references.
+        amount_minor: Outstanding amount in minor units (e.g. cents).
+        currency: ISO 4217 code; invoices only match payments in the same currency.
+        issue_date: Date the invoice was issued.
+        due_date: Date payment is expected.
+        counterparty: Customer name as stored in the ledger.
+        scope: Partition key (company, account); different scopes never match.
+    """
 
     def __new__(
         cls,
@@ -62,20 +73,7 @@ class Invoice:
         due_date: date,
         counterparty: str,
         scope: str = "default",
-    ) -> Self:
-        """Create an invoice.
-
-        Args:
-            id: Unique invoice identifier in the caller's system.
-            number: Human-facing invoice number searched for in payment references.
-            amount_minor: Outstanding amount in minor units (e.g. cents).
-            currency: ISO 4217 code; invoices only match payments in the same currency.
-            issue_date: Date the invoice was issued.
-            due_date: Date payment is expected.
-            counterparty: Customer name as stored in the ledger.
-            scope: Partition key (company, account); different scopes never match.
-        """
-
+    ) -> Self: ...
     @property
     def id(self) -> str:
         """Unique invoice identifier in the caller's system."""
@@ -112,7 +110,17 @@ class Invoice:
 
 @final
 class Payment:
-    """A bank movement received that may settle one or more invoices."""
+    """A bank movement received that may settle one or more invoices.
+
+    Args:
+        id: Unique movement identifier from the bank feed.
+        amount_minor: Received amount in minor units.
+        currency: ISO 4217 code.
+        value_date: Date the funds were credited.
+        reference: Free-text remittance info / description from the bank.
+        counterparty: Payer name as reported by the bank.
+        scope: Partition key; must equal the invoice scope to match.
+    """
 
     def __new__(
         cls,
@@ -123,19 +131,7 @@ class Payment:
         reference: str,
         counterparty: str,
         scope: str = "default",
-    ) -> Self:
-        """Create a payment.
-
-        Args:
-            id: Unique movement identifier from the bank feed.
-            amount_minor: Received amount in minor units.
-            currency: ISO 4217 code.
-            value_date: Date the funds were credited.
-            reference: Free-text remittance info / description from the bank.
-            counterparty: Payer name as reported by the bank.
-            scope: Partition key; must equal the invoice scope to match.
-        """
-
+    ) -> Self: ...
     @property
     def id(self) -> str:
         """Unique movement identifier from the bank feed."""
@@ -168,7 +164,19 @@ class Payment:
 
 @final
 class MatchConfig:
-    """Tolerances and thresholds that drive matching."""
+    """Tolerances and thresholds that drive matching.
+
+    Args:
+        amount_tolerance_minor: Absolute amount difference accepted (e.g. bank fees).
+        date_window_days: Max days between due date and value date.
+        max_group_size: Max invoices (1:N) or payments (N:1) in one group; below 2 disables
+            group search.
+        auto_threshold: Score at or above which a match is accepted automatically.
+        suggest_threshold: Score at or above which a match is proposed for review.
+        ambiguity_margin: If the best two candidates differ by less than this, flag ambiguous.
+        weights: Relative weight of each signal in the final score; None selects the default
+            weights.
+    """
 
     def __new__(
         cls,
@@ -179,22 +187,7 @@ class MatchConfig:
         suggest_threshold: float = 0.60,
         ambiguity_margin: float = 0.05,
         weights: dict[str, float] | None = None,
-    ) -> Self:
-        """Create a configuration.
-
-        Args:
-            amount_tolerance_minor: Absolute amount difference accepted (e.g. bank fees).
-            date_window_days: Max days between due date and value date.
-            max_group_size: Max invoices (1:N) or payments (N:1) in one group; below 2
-                disables group search.
-            auto_threshold: Score at or above which a match is accepted automatically.
-            suggest_threshold: Score at or above which a match is proposed for review.
-            ambiguity_margin: If the best two candidates differ by less than this, flag
-                ambiguous.
-            weights: Relative weight of each signal in the final score; None selects the
-                default weights.
-        """
-
+    ) -> Self: ...
     @property
     def amount_tolerance_minor(self) -> int:
         """Absolute amount difference accepted (e.g. bank fees)."""
@@ -227,7 +220,20 @@ class MatchConfig:
 
 @final
 class Match:
-    """A proposed link between payments and invoices."""
+    """A proposed link between payments and invoices.
+
+    Args:
+        kind: 1:1, 1:N or N:1.
+        status: auto, suggested or ambiguous.
+        payment_ids: Payments in the match.
+        invoice_ids: Invoices in the match.
+        score: Final weighted score in [0, 1].
+        breakdown: Per-signal scores that explain the final score.
+        residual_minor: Amount difference left after matching (fees, rounding).
+
+    Raises:
+        TypeError: kind or status is not a member of the matching enum.
+    """
 
     def __new__(
         cls,
@@ -238,22 +244,7 @@ class Match:
         score: float,
         breakdown: dict[str, float],
         residual_minor: int,
-    ) -> Self:
-        """Create a match.
-
-        Args:
-            kind: 1:1, 1:N or N:1.
-            status: auto, suggested or ambiguous.
-            payment_ids: Payments in the match.
-            invoice_ids: Invoices in the match.
-            score: Final weighted score in [0, 1].
-            breakdown: Per-signal scores that explain the final score.
-            residual_minor: Amount difference left after matching (fees, rounding).
-
-        Raises:
-            TypeError: kind or status is not a member of the matching enum.
-        """
-
+    ) -> Self: ...
     @property
     def kind(self) -> MatchKind:
         """Cardinality of the match: a MatchKind member."""
@@ -286,22 +277,20 @@ class Match:
 
 @final
 class ReconciliationResult:
-    """Output of a reconciliation run."""
+    """Output of a reconciliation run.
+
+    Args:
+        matches: Proposed matches, best score first.
+        unmatched_payments: Payment ids with no acceptable candidate.
+        unmatched_invoices: Invoice ids with no acceptable candidate.
+    """
 
     def __new__(
         cls,
         matches: Sequence[Match],
         unmatched_payments: Sequence[str],
         unmatched_invoices: Sequence[str],
-    ) -> Self:
-        """Create a result.
-
-        Args:
-            matches: Proposed matches, best score first.
-            unmatched_payments: Payment ids with no acceptable candidate.
-            unmatched_invoices: Invoice ids with no acceptable candidate.
-        """
-
+    ) -> Self: ...
     @property
     def matches(self) -> list[Match]:
         """Proposed matches, best score first; a new list on each access."""

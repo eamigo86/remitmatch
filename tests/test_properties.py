@@ -24,6 +24,8 @@ START = date(2024, 1, 1)
 SIGNALS = ["amount", "date", "name", "reference"]
 
 Inputs = tuple[list[Invoice], list[Payment], MatchConfig]
+InvoiceRaw = tuple[int, int, int, int, int, int]
+PaymentRaw = tuple[int, int, int, list[int], bool, int, int]
 
 # (scope, currency, amount, number, due offset, name)
 invoice_raw = st.tuples(
@@ -50,7 +52,7 @@ weights_raw = st.one_of(
 )
 
 
-def build_invoice(index: int, raw: tuple[int, int, int, int, int, int]) -> Invoice:
+def build_invoice(index: int, raw: InvoiceRaw) -> Invoice:
     """Turn a drawn tuple into an invoice with a unique id.
 
     Args:
@@ -74,7 +76,7 @@ def build_invoice(index: int, raw: tuple[int, int, int, int, int, int]) -> Invoi
     )
 
 
-def build_payment(index: int, raw: tuple[int, int, int, list[int], bool, int, int]) -> Payment:
+def build_payment(index: int, raw: PaymentRaw) -> Payment:
     """Turn a drawn tuple into a payment with a unique id.
 
     Args:
@@ -127,6 +129,42 @@ def configs(draw: st.DrawFn) -> MatchConfig:
 
 
 @st.composite
+def groups(draw: st.DrawFn) -> tuple[list[InvoiceRaw], list[PaymentRaw]]:
+    """Draw one group that the engine can match: a 1:N or an N:1 shape.
+
+    Args:
+        draw: Hypothesis draw function.
+
+    Returns:
+        The raw invoices and payments of the group. Either one payment that names two
+        invoices and pays their sum, or two payments that name one invoice and split it.
+    """
+    scope, currency, name, due = (
+        draw(st.integers(0, 1)),
+        draw(st.integers(0, 2)),
+        draw(st.integers(0, 3)),
+        draw(st.integers(0, 89)),
+    )
+    first, second = draw(st.integers(1, 20)), draw(st.integers(1, 20))
+    one, other = draw(st.sampled_from([(0, 1), (2, 5), (7, 12)]))
+    if draw(st.booleans()):
+        return (
+            [
+                (scope, currency, first, one, due, name),
+                (scope, currency, second, other, due, name),
+            ],
+            [(scope, currency, first + second, [one, other], False, due, name)],
+        )
+    return (
+        [(scope, currency, first + second, one, due, name)],
+        [
+            (scope, currency, first, [one], False, due, name),
+            (scope, currency, second, [one], False, due, name),
+        ],
+    )
+
+
+@st.composite
 def inputs(draw: st.DrawFn) -> Inputs:
     """Draw invoices, payments and a configuration.
 
@@ -134,10 +172,14 @@ def inputs(draw: st.DrawFn) -> Inputs:
         draw: Hypothesis draw function.
 
     Returns:
-        Up to 12 invoices and 12 payments with unique ids, and a configuration.
+        Invoices and payments with unique ids, mixing random rows with a few matchable
+        groups so that 1:N and N:1 matches are common, and a configuration.
     """
-    invoices = draw(st.lists(invoice_raw, max_size=12))
-    payments = draw(st.lists(payment_raw, max_size=12))
+    invoices = draw(st.lists(invoice_raw, max_size=8))
+    payments = draw(st.lists(payment_raw, max_size=8))
+    for group_invoices, group_payments in draw(st.lists(groups(), max_size=3)):
+        invoices += group_invoices
+        payments += group_payments
     return (
         [build_invoice(n, raw) for n, raw in enumerate(invoices)],
         [build_payment(n, raw) for n, raw in enumerate(payments)],
@@ -219,20 +261,24 @@ def test_invariants_hold_on_adversarial_inputs(data: Inputs) -> None:
     assert reconcile(invoices, payments, config) == result
 
 
-def test_strategy_produces_every_match_kind() -> None:
-    """The strategy reaches 1:1, 1:N and N:1 matches, so the invariants are not vacuous."""
-    seen: set[MatchKind] = set()
+def test_group_invariants_run_on_many_group_matches() -> None:
+    """Every invariant is checked on a derandomized run that yields many matches of each kind."""
+    counts = dict.fromkeys(MatchKind, 0)
 
     @settings(
         derandomize=True,
-        max_examples=2000,
+        max_examples=1000,
         deadline=None,
         database=None,
         phases=[Phase.generate],
     )
     @given(inputs())
-    def collect(data: Inputs) -> None:
-        seen.update(match.kind for match in reconcile(*data).matches)
+    def run(data: Inputs) -> None:
+        invoices, payments, config = data
+        result = reconcile(invoices, payments, config)
+        check(invoices, payments, config, result)
+        for match in result.matches:
+            counts[match.kind] += 1
 
-    collect()
-    assert seen == set(MatchKind)
+    run()
+    assert all(count >= 200 for count in counts.values()), counts
