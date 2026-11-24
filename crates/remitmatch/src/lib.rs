@@ -7,6 +7,8 @@
 //! All monetary amounts are integers in minor units (for example cents), never
 //! floating-point numbers.
 
+mod normalize;
+
 use std::collections::BTreeMap;
 
 use chrono::NaiveDate;
