@@ -128,7 +128,7 @@ class MatchConfig:
     Attributes:
         amount_tolerance_minor: Absolute amount difference accepted (e.g. bank fees).
         date_window_days: Max days between due date and value date.
-        max_group_size: Max invoices (1:N) or payments (N:1) in one group.
+        max_group_size: Max invoices (1:N) or payments (N:1) in one group; below 2 disables group search.
         auto_threshold: Score at or above which a match is accepted automatically.
         suggest_threshold: Score at or above which a match is proposed for review.
         ambiguity_margin: If the best two candidates differ by less than this, flag ambiguous.
@@ -238,13 +238,13 @@ The Rust core exposes the same contract as `remitmatch::reconcile(&[Invoice], &[
 The engine works in passes, from safest to most expensive: whatever one pass matches is removed from the next, so the group search only sees what's still unmatched.
 
 1. **Normalize and partition.** References uppercased with spaces and dashes removed; names without accents or company suffixes (S.L., LLC, Inc.). Currency codes are compared case-insensitively. Data is grouped by `(scope, currency)` and each partition is processed in parallel.
-2. **Reference pass.** An Aho-Corasick automaton built from the open invoice numbers finds, in a single scan, every invoice each description mentions. One invoice mentioned and the amount fits → 1:1. Several mentioned and the sum fits → 1:N. A number glued to another digit is not a mention and gets no partial reference score either, so `INV-1` is not found inside `INV-10`; whitespace counts as a boundary. This pass does not apply the date window.
+2. **Reference pass.** An Aho-Corasick automaton built from the open invoice numbers finds, in a single scan, every invoice each description mentions. Each mentioned invoice is tried alone (amount fits → 1:1) and every subset of 2 to `max_group_size` mentioned invoices is tried together (sum fits → 1:N). Payments that cite the same invoice and add up to it form an N:1. The tolerance applies once, to the group total. A number glued to another digit is not a mention and gets no partial reference score either, so `INV-1` is not found inside `INV-10`; whitespace counts as a boundary. This pass does not apply the date window.
 3. **1:1 candidates.** An index sorted by amount returns only the invoices within tolerance; those are then filtered by date window and scored. This avoids comparing everything against everything. Fuzzy reference similarity is not used for a payment whose reference already names an open invoice exactly.
-4. **1:N groups.** For each unmatched payment: open invoices from the same counterparty (name above the threshold) and within the window. The engine looks for a subset whose sum equals the payment amount ± tolerance, with at most `max_group_size` invoices.
-   1. It's a *subset-sum* variant: bounded by a maximum number of candidates (e.g. 24) and solved with *meet-in-the-middle*; if there are more, the oldest invoices take priority.
-   2. If more than one subset is valid, the match is flagged `ambiguous`.
-5. **N:1 groups.** The same in reverse: unmatched payments from the same counterparty whose sum covers one invoice (partial payments).
-6. **Global assignment.** All candidates are sorted by score and accepted greedily when none of their ids is already taken. If a payment's second-best candidate is within `ambiguity_margin`, the status is `ambiguous`, never `auto`. Ambiguity is evaluated per pass. Rows with a non-positive amount never match.
+4. **1:N groups.** For each unmatched payment: open invoices from the same counterparty (name signal of at least 0.85), within the window and not larger than the payment plus the tolerance. The engine looks for a subset whose sum equals the payment amount ± tolerance, with at most `max_group_size` invoices.
+   1. It's a *subset-sum* variant: bounded by a maximum number of candidates (24) and solved with *meet-in-the-middle*; if there are more, the 24 oldest invoices are searched, and at most 32 subsets are kept.
+   2. If more than one subset is valid, the match is flagged `ambiguous`. This holds in every group pass, the reference pass included.
+5. **N:1 groups.** The same in reverse: unmatched payments from the same counterparty (name, window and amount filters mirrored) whose sum equals one invoice amount ± tolerance. A group is proposed only when the sum fits, so partial payments that do not yet add up stay unmatched.
+6. **Global assignment.** All candidates are sorted by score and accepted greedily when none of their ids is already taken. If an anchor's second-best candidate is within `ambiguity_margin`, the status is `ambiguous`, never `auto`. The anchor is the payment for 1:1 and 1:N, and the invoice for N:1. Ambiguity is evaluated per pass. Rows with a non-positive amount never match.
 7. **Final status.** `auto` if the score is above `auto_threshold` and not ambiguous; `suggested` if above `suggest_threshold`; everything else stays unmatched.
 
 **Scoring.** A weighted sum of four signals in [0, 1], also returned individually in `breakdown`. The weighted sum is divided by the sum of the weights:
@@ -255,6 +255,8 @@ The engine works in passes, from safest to most expensive: whatever one pass mat
 | Amount | 1 if exact; decreases linearly to 0 at the tolerance limit | 0.30 |
 | Name | Jaro-Winkler on normalized names | 0.15 |
 | Date | 1 within 3 days of the due date; decreases linearly to the end of the window | 0.10 |
+
+**Group scoring.** The same four signals, computed over the payment-invoice pairs of the group: reference is the share of pairs where the payment names the invoice exactly (no partial score in groups), amount reads the difference between the two totals, name is the minimum over the pairs, and date is the mean over the pairs.
 
 Greedy assignment is enough for v1; the Hungarian algorithm for optimal 1:1 assignment is a follow-up improvement measured in the benchmarks.
 
@@ -347,12 +349,13 @@ If week 4 runs long, 0.1.0 ships with 1:1 and 1:N only, and N:1 moves to 0.2.0.
 **Open decisions**
 
 - [x] Reserve the name by publishing an empty 0.0.1 on PyPI and crates.io (done 2026-11-24)
-- [ ] Default scoring weights: tune them with the generator data. With the current defaults, a payment without a reference signal can score at most 0.55, below the 0.60 suggest threshold, and an amount at the tolerance limit scores 0
+- [ ] Default scoring weights: tune them with the generator data. With the current defaults, a payment without a reference signal can score at most 0.55, below the 0.60 suggest threshold, and an amount at the tolerance limit scores 0. For groups the same ceiling applies: a group found only by counterparty has no reference signal and scores at most 0.55 under the defaults, so the counterparty passes only produce matches for a partly mentioned group or with custom weights or thresholds
 - [ ] Percentage amount tolerance is listed in Scope v1, but `MatchConfig` has no field for it yet
 - [ ] Decide whether a match with only a partial (misspelled) reference may be `auto` or must stay `suggested`; today it can be `auto` when the other signals are strong (for example invoice INV-2024-001 and reference INV-2024-010)
 - [ ] Short or purely numeric invoice numbers (for example 7 or 100) can be found inside unrelated text such as an amount, and an exact amount plus a close date is then enough for `auto`
 - [ ] The candidate pass scores every same-amount pair and the partial reference search is unoptimized (about 66 microseconds per pair); address it in the benchmarks milestone
 - [ ] Candidate limit for the group search (24 is an initial estimate)
+- [ ] The per-payment time budget from the risk table is not implemented; the group search is bounded by the 24-candidate and 32-subset limits instead
 - [x] License: MIT OR Apache-2.0 (dual, as is common in Rust)
 
 ## Alternatives considered
