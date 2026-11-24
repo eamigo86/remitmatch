@@ -510,3 +510,61 @@ fn matches_come_best_score_first_and_unmatched_keep_input_order() {
     assert_eq!(r.unmatched_payments, vec!["p3", "p4"]);
     assert_eq!(r.unmatched_invoices, vec!["i3", "i4"]);
 }
+
+/// Two payments compete for `i1`; `p2` also mentions `i2`, which is due 20 days later and
+/// therefore scores about 0.063 lower. `p1` wins `i1`, so `p2` gets `i2`.
+fn contested_invoice(config: &MatchConfig) -> ReconciliationResult {
+    let late = Invoice {
+        due_date: day(30),
+        ..inv("i2", "INV-2", 10_000)
+    };
+    run(
+        &[inv("i1", "INV-1", 10_000), late],
+        &[pay("p1", 10_000, "INV-1"), pay("p2", 10_000, "INV-1 INV-2")],
+        config,
+    )
+}
+
+fn status_of(r: &ReconciliationResult, payment_id: &str) -> MatchStatus {
+    r.matches
+        .iter()
+        .find(|m| m.payment_ids[0] == payment_id)
+        .unwrap_or_else(|| panic!("{payment_id} is not matched"))
+        .status
+}
+
+#[test]
+fn zero_margin_never_yields_ambiguous() {
+    let config = MatchConfig {
+        ambiguity_margin: 0.0,
+        ..MatchConfig::default()
+    };
+    let r = contested_invoice(&config);
+    assert_eq!(r.matches.len(), 2);
+    assert!(r.matches.iter().all(|m| m.status != MatchStatus::Ambiguous));
+    let tie = run(
+        &[inv("i1", "INV-7", 10_000), inv("i2", "INV-7", 10_000)],
+        &[pay("p1", 10_000, "INV-7")],
+        &config,
+    );
+    assert_eq!(tie.matches[0].status, MatchStatus::Auto);
+}
+
+#[test]
+fn taken_best_candidate_with_a_large_gap_is_not_ambiguous() {
+    let r = contested_invoice(&MatchConfig::default());
+    assert_eq!(r.matches.len(), 2);
+    let p2 = r.matches.iter().find(|m| m.payment_ids[0] == "p2").unwrap();
+    assert_eq!(p2.invoice_ids, vec!["i2"]);
+    assert_eq!(status_of(&r, "p2"), MatchStatus::Auto);
+}
+
+#[test]
+fn candidates_closer_than_the_margin_stay_ambiguous() {
+    let config = MatchConfig {
+        ambiguity_margin: 0.1,
+        ..MatchConfig::default()
+    };
+    let r = contested_invoice(&config);
+    assert_eq!(status_of(&r, "p2"), MatchStatus::Ambiguous);
+}
