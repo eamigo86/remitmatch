@@ -1,0 +1,251 @@
+//! Signal functions and the weighted score of a payment-invoice candidate.
+
+#![cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into the engine in a later commit")
+)]
+
+use std::collections::BTreeMap;
+
+use chrono::NaiveDate;
+
+/// Tolerance for comparing floating-point scores against thresholds.
+pub(crate) const EPS: f64 = 1e-9;
+
+/// Days around the due date that still score a perfect date signal.
+const DATE_GRACE_DAYS: i64 = 3;
+
+/// Minimum fuzzy similarity that counts as a partial reference signal.
+const FUZZY_FLOOR: f64 = 0.8;
+
+/// Shortest invoice number (in characters) eligible for fuzzy matching.
+const FUZZY_MIN_LEN: usize = 4;
+
+/// The four raw signals of one candidate, each in the range 0 to 1.
+pub(crate) struct Signals {
+    pub(crate) reference: f64,
+    pub(crate) amount: f64,
+    pub(crate) name: f64,
+    pub(crate) date: f64,
+}
+
+/// Non-negative weights of the four signals.
+pub(crate) struct Weights {
+    pub(crate) reference: f64,
+    pub(crate) amount: f64,
+    pub(crate) name: f64,
+    pub(crate) date: f64,
+}
+
+impl Weights {
+    /// Reads the weights from the configuration map; a missing key counts as 0.
+    pub(crate) fn from_map(map: &BTreeMap<String, f64>) -> Self {
+        let get = |key: &str| map.get(key).copied().unwrap_or(0.0);
+        Self {
+            reference: get("reference"),
+            amount: get("amount"),
+            name: get("name"),
+            date: get("date"),
+        }
+    }
+}
+
+/// Scores the amount difference: 1 when exact, linear down to 0 at the tolerance.
+pub(crate) fn amount_signal(diff: u64, tolerance: i64) -> f64 {
+    if diff == 0 {
+        return 1.0;
+    }
+    match u64::try_from(tolerance) {
+        // u64 to f64 loses precision only above 2^53 minor units, far beyond real amounts.
+        Ok(t) if t > 0 => (1.0 - diff as f64 / t as f64).max(0.0),
+        _ => 0.0,
+    }
+}
+
+/// Scores two already normalized names with Jaro-Winkler; 0 when either is empty.
+pub(crate) fn name_signal(payment_name: &str, invoice_name: &str) -> f64 {
+    if payment_name.is_empty() || invoice_name.is_empty() {
+        return 0.0;
+    }
+    strsim::jaro_winkler(payment_name, invoice_name)
+}
+
+/// Scores the distance between value date and due date against the window.
+pub(crate) fn date_signal(value_date: NaiveDate, due_date: NaiveDate, window_days: u32) -> f64 {
+    let d = value_date.signed_duration_since(due_date).num_days().abs();
+    let window = i64::from(window_days);
+    if d <= DATE_GRACE_DAYS {
+        1.0
+    } else if d >= window {
+        0.0
+    } else {
+        1.0 - (d - DATE_GRACE_DAYS) as f64 / (window - DATE_GRACE_DAYS) as f64
+    }
+}
+
+/// Finds the best approximate occurrence of `number` inside `reference`.
+///
+/// Both arguments are normalized. Returns the similarity when it reaches the floor, else 0.
+// ponytail: naive sliding window, O(len(reference) * len(number)) per candidate; build a
+// q-gram index per partition if long references dominate the benchmarks.
+pub(crate) fn fuzzy_reference_signal(number: &str, reference: &str) -> f64 {
+    let n = number.chars().count();
+    if n < FUZZY_MIN_LEN {
+        return 0.0;
+    }
+    let chars: Vec<char> = reference.chars().collect();
+    let mut best = 0.0_f64;
+    for len in (n - 1)..=(n + 1) {
+        for window in chars.windows(len) {
+            let candidate: String = window.iter().collect();
+            best = best.max(strsim::normalized_damerau_levenshtein(number, &candidate));
+        }
+    }
+    if best >= FUZZY_FLOOR { best } else { 0.0 }
+}
+
+/// Combines the signals into `sum(w * s) / sum(w)`.
+///
+/// The caller guarantees a positive weight sum (validated in the configuration).
+pub(crate) fn weighted_score(signals: &Signals, weights: &Weights) -> f64 {
+    let total = weights.reference + weights.amount + weights.name + weights.date;
+    (weights.reference * signals.reference
+        + weights.amount * signals.amount
+        + weights.name * signals.name
+        + weights.date * signals.date)
+        / total
+}
+
+/// Returns the four raw signals keyed by `reference`, `amount`, `name` and `date`.
+pub(crate) fn breakdown(signals: &Signals) -> BTreeMap<String, f64> {
+    [
+        ("reference", signals.reference),
+        ("amount", signals.amount),
+        ("name", signals.name),
+        ("date", signals.date),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_owned(), value))
+    .collect()
+}
+
+/// Returns whether `score` reaches `threshold`, tolerating floating-point noise.
+pub(crate) fn meets(score: f64, threshold: f64) -> bool {
+    score + EPS >= threshold
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn day(d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2024, 3, d).unwrap()
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn amount_is_one_when_exact_and_linear_to_the_tolerance() {
+        assert!(close(amount_signal(0, 0), 1.0));
+        assert!(close(amount_signal(0, 100), 1.0));
+        assert!(close(amount_signal(25, 100), 0.75));
+        assert!(close(amount_signal(100, 100), 0.0));
+    }
+
+    #[test]
+    fn amount_outside_tolerance_or_without_tolerance_is_zero() {
+        assert!(close(amount_signal(150, 100), 0.0));
+        assert!(close(amount_signal(1, 0), 0.0));
+    }
+
+    #[test]
+    fn name_uses_jaro_winkler_and_is_zero_when_empty() {
+        assert!(close(name_signal("acme", "acme"), 1.0));
+        assert!(name_signal("acme", "acne") > 0.8);
+        assert!(close(name_signal("", "acme"), 0.0));
+        assert!(close(name_signal("acme", ""), 0.0));
+    }
+
+    #[test]
+    fn date_is_one_within_the_grace_days() {
+        assert!(close(date_signal(day(10), day(10), 30), 1.0));
+        assert!(close(date_signal(day(13), day(10), 30), 1.0));
+        assert!(close(date_signal(day(7), day(10), 30), 1.0));
+    }
+
+    #[test]
+    fn date_decreases_linearly_and_is_zero_at_the_window() {
+        // Six days apart: (6 - 3) of the (30 - 3) days of decay are used.
+        assert!(close(date_signal(day(16), day(10), 30), 1.0 - 3.0 / 27.0));
+        assert!(close(date_signal(day(10), day(1), 9), 0.0));
+        assert!(close(date_signal(day(10), day(1), 5), 0.0));
+    }
+
+    #[test]
+    fn fuzzy_reference_scores_a_misspelling_partially() {
+        let s = fuzzy_reference_signal("INV2024001", "PAGO INV2024010 GRACIAS");
+        assert!((0.8..1.0).contains(&s), "got {s}");
+    }
+
+    #[test]
+    fn fuzzy_reference_is_zero_below_the_similarity_floor() {
+        assert!(close(
+            fuzzy_reference_signal("INV2024001", "TRANSFER 55 RENT"),
+            0.0
+        ));
+    }
+
+    #[test]
+    fn fuzzy_reference_is_zero_for_short_numbers() {
+        assert!(close(fuzzy_reference_signal("A12", "A12"), 0.0));
+    }
+
+    #[test]
+    fn weights_missing_keys_count_as_zero() {
+        let map = BTreeMap::from([("amount".to_owned(), 2.0)]);
+        let w = Weights::from_map(&map);
+        assert!(close(w.amount, 2.0));
+        assert!(close(w.reference + w.name + w.date, 0.0));
+    }
+
+    #[test]
+    fn weighted_score_is_the_normalized_weighted_sum() {
+        let w = Weights {
+            reference: 1.0,
+            amount: 1.0,
+            name: 2.0,
+            date: 0.0,
+        };
+        let s = Signals {
+            reference: 1.0,
+            amount: 0.0,
+            name: 0.5,
+            date: 1.0,
+        };
+        assert!(close(weighted_score(&s, &w), 0.5));
+    }
+
+    #[test]
+    fn breakdown_holds_the_four_raw_signals() {
+        let s = Signals {
+            reference: 1.0,
+            amount: 0.5,
+            name: 0.25,
+            date: 0.0,
+        };
+        let b = breakdown(&s);
+        let keys: Vec<&str> = b.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["amount", "date", "name", "reference"]);
+        assert!(close(b["amount"], 0.5));
+        assert!(close(b["reference"], 1.0));
+    }
+
+    #[test]
+    fn threshold_helper_tolerates_float_noise() {
+        assert!(meets(0.90 - 1e-12, 0.90));
+        assert!(meets(0.90, 0.90));
+        assert!(!meets(0.89, 0.90));
+    }
+}

@@ -8,6 +8,7 @@
 //! floating-point numbers.
 
 mod normalize;
+mod score;
 
 use std::collections::BTreeMap;
 
