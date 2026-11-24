@@ -16,6 +16,7 @@
 mod engine;
 mod normalize;
 mod score;
+mod subset;
 
 use std::collections::BTreeMap;
 use std::fmt;
