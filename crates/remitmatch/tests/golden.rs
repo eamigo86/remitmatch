@@ -181,13 +181,32 @@ fn shorter_number_is_not_a_mention_inside_a_longer_one() {
 }
 
 #[test]
-fn shorter_number_alone_is_never_an_exact_mention_inside_a_longer_one() {
+fn shorter_number_alone_gets_no_reference_score_inside_a_longer_one() {
+    let r = run(
+        &[inv("i1", "INV-1", 10_000)],
+        &[pay("p1", 10_000, "INV-10")],
+        &no_reference_config(),
+    );
+    assert_eq!(r.matches.len(), 1);
+    assert!(close(r.matches[0].breakdown["reference"], 0.0));
     let r = run(
         &[inv("i1", "INV-1", 10_000)],
         &[pay("p1", 10_000, "INV-10")],
         &MatchConfig::default(),
     );
-    assert!(r.matches.iter().all(|m| m.breakdown["reference"] < 1.0));
+    assert!(r.matches.is_empty());
+}
+
+#[test]
+fn number_glued_to_other_digits_stays_unmatched_under_default_weights() {
+    let r = run(
+        &[inv("i1", "1001", 10_000)],
+        &[pay("p1", 10_000, "PAGO FRA 10010")],
+        &MatchConfig::default(),
+    );
+    assert!(r.matches.is_empty());
+    assert_eq!(r.unmatched_payments, vec!["p1"]);
+    assert_eq!(r.unmatched_invoices, vec!["i1"]);
 }
 
 #[test]
