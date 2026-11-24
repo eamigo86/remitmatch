@@ -811,3 +811,191 @@ fn group_sums_beyond_i64_do_not_overflow() {
     assert_eq!(r.matches[0].kind, MatchKind::OneToMany);
     assert_eq!(r.matches[0].residual_minor, -1);
 }
+
+// The counterparty group passes find groups with no reference signal. Under the default
+// weights such a group scores at most 0.55, below the suggest threshold of 0.60, so the
+// tests below that expect a match use `no_reference_config()` (amount 0.6, name 0.2,
+// date 0.2), where a perfect group scores 1.0 without any reference.
+
+#[test]
+fn one_to_many_is_found_by_counterparty_without_a_reference() {
+    let r = run(
+        &[inv("i1", "INV-1", 6_000), inv("i2", "INV-2", 4_000)],
+        &[pay("p1", 10_000, "thanks")],
+        &no_reference_config(),
+    );
+    assert_eq!(r.matches.len(), 1);
+    let m = &r.matches[0];
+    assert_eq!(m.kind, MatchKind::OneToMany);
+    assert_eq!(m.status, MatchStatus::Auto);
+    assert_eq!(m.payment_ids, vec!["p1"]);
+    assert_eq!(m.invoice_ids, vec!["i1", "i2"]);
+    assert_eq!(m.residual_minor, 0);
+    assert!(close(m.breakdown["reference"], 0.0));
+    assert!(close(m.score, 1.0));
+}
+
+#[test]
+fn many_to_one_is_found_by_counterparty_without_a_reference() {
+    let r = run(
+        &[inv("i1", "INV-1", 10_000)],
+        &[pay("p1", 4_000, "thanks"), pay("p2", 6_000, "thanks")],
+        &no_reference_config(),
+    );
+    assert_eq!(r.matches.len(), 1);
+    let m = &r.matches[0];
+    assert_eq!(m.kind, MatchKind::ManyToOne);
+    assert_eq!(m.status, MatchStatus::Auto);
+    assert_eq!(m.payment_ids, vec!["p1", "p2"]);
+    assert_eq!(m.invoice_ids, vec!["i1"]);
+    assert!(close(m.breakdown["reference"], 0.0));
+}
+
+#[test]
+fn no_reference_group_stays_unmatched_under_default_weights() {
+    let r = run(
+        &[inv("i1", "INV-1", 6_000), inv("i2", "INV-2", 4_000)],
+        &[pay("p1", 10_000, "thanks")],
+        &MatchConfig::default(),
+    );
+    assert!(r.matches.is_empty());
+    assert_eq!(r.unmatched_payments, vec!["p1"]);
+    assert_eq!(r.unmatched_invoices, vec!["i1", "i2"]);
+    let r = run(
+        &[inv("i1", "INV-1", 10_000)],
+        &[pay("p1", 4_000, "thanks"), pay("p2", 6_000, "thanks")],
+        &MatchConfig::default(),
+    );
+    assert!(r.matches.is_empty());
+}
+
+#[test]
+fn partly_named_group_scores_half_the_reference_signal() {
+    let r = run(
+        &[inv("i1", "INV-1", 6_000), inv("i2", "INV-2", 4_000)],
+        &[pay("p1", 10_000, "INV-1")],
+        &MatchConfig::default(),
+    );
+    assert_eq!(r.matches.len(), 1);
+    let m = &r.matches[0];
+    assert_eq!(m.kind, MatchKind::OneToMany);
+    assert_eq!(m.invoice_ids, vec!["i1", "i2"]);
+    assert!(close(m.breakdown["reference"], 0.5));
+    // 0.45 * 0.5 + 0.30 + 0.15 + 0.10 = 0.775: above suggest, below auto.
+    assert_eq!(m.status, MatchStatus::Suggested);
+}
+
+#[test]
+fn invoice_with_a_dissimilar_name_is_left_out_of_the_pool() {
+    let stranger = Invoice {
+        counterparty: "Zeta Holdings".to_owned(),
+        ..inv("i2", "INV-2", 4_000)
+    };
+    let r = run(
+        &[inv("i1", "INV-1", 6_000), stranger],
+        &[pay("p1", 10_000, "thanks")],
+        &no_reference_config(),
+    );
+    assert!(r.matches.is_empty());
+    assert_eq!(r.unmatched_invoices, vec!["i1", "i2"]);
+    let stranger = Payment {
+        counterparty: "Zeta Holdings".to_owned(),
+        ..pay("p2", 6_000, "thanks")
+    };
+    let r = run(
+        &[inv("i1", "INV-1", 10_000)],
+        &[pay("p1", 4_000, "thanks"), stranger],
+        &no_reference_config(),
+    );
+    assert!(r.matches.is_empty());
+    assert_eq!(r.unmatched_payments, vec!["p1", "p2"]);
+}
+
+#[test]
+fn rows_outside_the_date_window_are_left_out_of_the_pool() {
+    let late = Invoice {
+        due_date: day(10 + 40),
+        ..inv("i2", "INV-2", 4_000)
+    };
+    let r = run(
+        &[inv("i1", "INV-1", 6_000), late],
+        &[pay("p1", 10_000, "thanks")],
+        &no_reference_config(),
+    );
+    assert!(r.matches.is_empty());
+    let late = Payment {
+        value_date: day(10 + 40),
+        ..pay("p2", 6_000, "thanks")
+    };
+    let r = run(
+        &[inv("i1", "INV-1", 10_000)],
+        &[pay("p1", 4_000, "thanks"), late],
+        &no_reference_config(),
+    );
+    assert!(r.matches.is_empty());
+}
+
+#[test]
+fn several_valid_subsets_found_by_counterparty_are_ambiguous() {
+    let r = run(
+        &[
+            inv("i1", "INV-1", 6_000),
+            inv("i2", "INV-2", 4_000),
+            inv("i3", "INV-3", 3_000),
+            inv("i4", "INV-4", 7_000),
+        ],
+        &[pay("p1", 10_000, "thanks")],
+        &no_reference_config(),
+    );
+    assert_eq!(r.matches.len(), 1);
+    let m = &r.matches[0];
+    assert_eq!(m.status, MatchStatus::Ambiguous);
+    assert_eq!(m.invoice_ids, vec!["i1", "i2"]);
+    assert_eq!(r.unmatched_invoices, vec!["i3", "i4"]);
+}
+
+/// 24 old invoices of 200 plus two newer ones (300 and 450) that add up to a payment of 750.
+fn crowded_pool(old: usize) -> Vec<Invoice> {
+    let mut invoices: Vec<Invoice> = (0..old)
+        .map(|k| Invoice {
+            due_date: day(k as u64 % 10),
+            ..inv(&format!("old{k:02}"), &format!("OLD-{k:02}"), 200)
+        })
+        .collect();
+    invoices.push(Invoice {
+        due_date: day(20),
+        ..inv("new1", "NEW-1", 300)
+    });
+    invoices.push(Invoice {
+        due_date: day(21),
+        ..inv("new2", "NEW-2", 450)
+    });
+    invoices
+}
+
+#[test]
+fn a_pool_larger_than_24_only_considers_the_24_oldest() {
+    let payments = [pay("p1", 750, "thanks")];
+    let r = run(&crowded_pool(24), &payments, &no_reference_config());
+    assert!(r.matches.is_empty());
+    let r = run(&crowded_pool(22), &payments, &no_reference_config());
+    assert_eq!(r.matches.len(), 1);
+    assert_eq!(r.matches[0].invoice_ids, vec!["new1", "new2"]);
+}
+
+#[test]
+fn the_one_to_one_pass_runs_before_the_group_passes() {
+    let r = run(
+        &[
+            inv("i1", "INV-1", 6_000),
+            inv("i2", "INV-2", 4_000),
+            inv("i3", "INV-3", 10_000),
+        ],
+        &[pay("p1", 10_000, "thanks")],
+        &no_reference_config(),
+    );
+    assert_eq!(r.matches.len(), 1);
+    assert_eq!(r.matches[0].kind, MatchKind::OneToOne);
+    assert_eq!(r.matches[0].invoice_ids, vec!["i3"]);
+    assert_eq!(r.unmatched_invoices, vec!["i1", "i2"]);
+}
