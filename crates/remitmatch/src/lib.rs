@@ -1,16 +1,24 @@
 //! Matches bank payments to open invoices and explains every match.
 //!
-//! Version 0.0.1 reserves the crate name and defines the public data model from
-//! RFC 0001. It contains no matching logic yet; the first matching engine is
-//! planned for 0.1.0.
+//! The entry point is [`reconcile`], which pairs each [`Payment`] with at most one
+//! [`Invoice`] (1:1 matching) and returns a [`ReconciliationResult`]. Every [`Match`]
+//! carries a per-signal `breakdown` that explains its score. Grouped matches (1:N and
+//! N:1) are planned for later releases.
+//!
+//! Matching works in two passes. The reference pass looks for invoice numbers inside the
+//! payment reference; the candidate pass scores the invoices whose amount is within
+//! tolerance and whose due date is inside the date window. Payments and invoices only
+//! match inside the same scope and currency.
 //!
 //! All monetary amounts are integers in minor units (for example cents), never
 //! floating-point numbers.
 
+mod engine;
 mod normalize;
 mod score;
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use chrono::NaiveDate;
 
@@ -148,6 +156,100 @@ pub struct Match {
     pub breakdown: BTreeMap<String, f64>,
     /// Amount difference left after matching, in minor units (fees, rounding).
     pub residual_minor: i64,
+}
+
+/// The outcome of a reconciliation run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReconciliationResult {
+    /// Proposed matches, best score first; ties keep payment input order.
+    pub matches: Vec<Match>,
+    /// Identifiers of the payments with no acceptable candidate, in input order.
+    pub unmatched_payments: Vec<String>,
+    /// Identifiers of the invoices with no acceptable candidate, in input order.
+    pub unmatched_invoices: Vec<String>,
+}
+
+/// An error returned by [`reconcile`] before any matching happens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Error {
+    /// Two invoices share the same identifier.
+    DuplicateInvoiceId(String),
+    /// Two payments share the same identifier.
+    DuplicatePaymentId(String),
+    /// The configuration is invalid; the message names the offending field.
+    InvalidConfig(String),
+    /// The reference index could not be built, for example because the pattern set is too large.
+    ReferenceIndex(String),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateInvoiceId(id) => write!(f, "duplicate invoice id: {id}"),
+            Self::DuplicatePaymentId(id) => write!(f, "duplicate payment id: {id}"),
+            Self::InvalidConfig(message) => write!(f, "invalid configuration: {message}"),
+            Self::ReferenceIndex(message) => write!(f, "cannot build reference index: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// Matches payments to open invoices one to one and explains every match.
+///
+/// Each invoice and each payment appears in at most one [`Match`]. Rows whose amount is
+/// not positive never match. Payments and invoices only match inside the same scope and
+/// currency (compared case-insensitively). Weights missing from
+/// [`MatchConfig::weights`] count as zero, and `max_group_size` is not used yet.
+///
+/// # Errors
+///
+/// Returns [`Error::DuplicateInvoiceId`] or [`Error::DuplicatePaymentId`] when an
+/// identifier repeats, [`Error::InvalidConfig`] when the configuration is out of range
+/// (thresholds outside 0 to 1, a suggest threshold above the auto threshold, a negative
+/// tolerance or margin, an unknown or negative weight, or weights that sum to zero), and
+/// [`Error::ReferenceIndex`] when the reference index cannot be built.
+///
+/// # Examples
+///
+/// ```
+/// use chrono::NaiveDate;
+/// use remitmatch::{reconcile, Invoice, MatchConfig, MatchStatus, Payment};
+///
+/// let date = NaiveDate::from_ymd_opt(2024, 3, 1).unwrap();
+/// let invoice = Invoice {
+///     id: "i1".to_owned(),
+///     number: "INV-001".to_owned(),
+///     amount_minor: 10_000,
+///     currency: "EUR".to_owned(),
+///     issue_date: date,
+///     due_date: date,
+///     counterparty: "Acme S.L.".to_owned(),
+///     scope: "main".to_owned(),
+/// };
+/// let payment = Payment {
+///     id: "p1".to_owned(),
+///     amount_minor: 10_000,
+///     currency: "EUR".to_owned(),
+///     value_date: date,
+///     reference: "Payment inv 001".to_owned(),
+///     counterparty: "ACME".to_owned(),
+///     scope: "main".to_owned(),
+/// };
+///
+/// let result = reconcile(&[invoice], &[payment], &MatchConfig::default())?;
+/// assert_eq!(result.matches.len(), 1);
+/// assert_eq!(result.matches[0].status, MatchStatus::Auto);
+/// assert!(result.unmatched_payments.is_empty());
+/// # Ok::<(), remitmatch::Error>(())
+/// ```
+pub fn reconcile(
+    invoices: &[Invoice],
+    payments: &[Payment],
+    config: &MatchConfig,
+) -> Result<ReconciliationResult, Error> {
+    engine::reconcile(invoices, payments, config)
 }
 
 #[cfg(test)]

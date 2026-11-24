@@ -1,10 +1,5 @@
 //! Signal functions and the weighted score of a payment-invoice candidate.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the engine in a later commit")
-)]
-
 use std::collections::BTreeMap;
 
 use chrono::NaiveDate;
@@ -85,7 +80,9 @@ pub(crate) fn date_signal(value_date: NaiveDate, due_date: NaiveDate, window_day
 
 /// Finds the best approximate occurrence of `number` inside `reference`.
 ///
-/// Both arguments are normalized. Returns the similarity when it reaches the floor, else 0.
+/// Both arguments are normalized. Exact occurrences are skipped: the caller already accepted
+/// or rejected them as mentions, and a rejected one must stay a partial signal. Returns the
+/// similarity when it reaches the floor, else 0.
 // ponytail: naive sliding window, O(len(reference) * len(number)) per candidate; build a
 // q-gram index per partition if long references dominate the benchmarks.
 pub(crate) fn fuzzy_reference_signal(number: &str, reference: &str) -> f64 {
@@ -98,6 +95,9 @@ pub(crate) fn fuzzy_reference_signal(number: &str, reference: &str) -> f64 {
     for len in (n - 1)..=(n + 1) {
         for window in chars.windows(len) {
             let candidate: String = window.iter().collect();
+            if candidate == number {
+                continue;
+            }
             best = best.max(strsim::normalized_damerau_levenshtein(number, &candidate));
         }
     }
@@ -195,6 +195,14 @@ mod tests {
             fuzzy_reference_signal("INV2024001", "TRANSFER 55 RENT"),
             0.0
         ));
+    }
+
+    #[test]
+    fn fuzzy_reference_never_scores_an_exact_occurrence_as_one() {
+        // An exact occurrence that reaches the fuzzy path was rejected as a mention
+        // (it splits a digit run), so it must stay a partial signal.
+        let s = fuzzy_reference_signal("INV1", "INV10");
+        assert!(s < 1.0, "got {s}");
     }
 
     #[test]
