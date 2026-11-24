@@ -1,5 +1,7 @@
 """Tests for the native data model classes and the Python enums."""
 
+import copy
+import pickle
 from datetime import date
 from enum import Enum
 
@@ -12,6 +14,7 @@ from remitmatch import (
     MatchStatus,
     Payment,
     ReconciliationResult,
+    reconcile,
 )
 
 DEFAULT_WEIGHTS = {"reference": 0.45, "amount": 0.30, "name": 0.15, "date": 0.10}
@@ -272,3 +275,46 @@ def test_out_of_range_numbers_raise() -> None:
         MatchConfig(date_window_days=-1)
     with pytest.raises(OverflowError):
         MatchConfig(max_group_size=-1)
+
+
+def reconciled_result() -> ReconciliationResult:
+    """Build a result by running reconcile on one invoice and one payment.
+
+    Returns:
+        A result with one match.
+    """
+    return reconcile([make_invoice()], [make_payment()])
+
+
+COPYABLE = [
+    make_invoice(),
+    make_payment(),
+    MatchConfig(),
+    MatchConfig(amount_tolerance_minor=3, max_group_size=2, weights={"amount": 1.0}),
+    make_match(),
+    ReconciliationResult([make_match()], ["p2"], ["i2"]),
+    reconciled_result(),
+]
+
+
+@pytest.mark.parametrize("instance", COPYABLE)
+def test_copy_and_deepcopy_give_equal_objects(instance: object) -> None:
+    """Shallow and deep copies compare equal to the original."""
+    assert copy.copy(instance) == instance
+    assert copy.deepcopy(instance) == instance
+
+
+@pytest.mark.parametrize("instance", COPYABLE)
+@pytest.mark.parametrize("protocol", range(2, pickle.HIGHEST_PROTOCOL + 1))
+def test_pickle_round_trip(instance: object, protocol: int) -> None:
+    """Pickling and unpickling gives an equal object of the same class."""
+    restored = pickle.loads(pickle.dumps(instance, protocol=protocol))
+    assert restored == instance
+    assert type(restored) is type(instance)
+
+
+def test_pickled_match_keeps_enum_members() -> None:
+    """Enum members of a pickled match are the real enum members."""
+    restored = pickle.loads(pickle.dumps(make_match()))
+    assert restored.kind is MatchKind.ONE_TO_ONE
+    assert restored.status is MatchStatus.AUTO
