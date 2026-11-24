@@ -264,6 +264,7 @@ version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "229ca13b8a15bb0d1487b81ab975bfcd97513416499a8312011b6036e42e0de4"
 dependencies = [
+ "chrono",
  "libc",
  "once_cell",
  "portable-atomic",
@@ -382,6 +383,7 @@ dependencies = [
 name = "remitmatch-py"
 version = "0.0.1"
 dependencies = [
+ "chrono",
  "pyo3",
  "remitmatch",
 ]
