@@ -8,6 +8,9 @@
 //! that names several invoices whose amounts add up is a 1:N match, and several payments
 //! that name one invoice and add up to it are an N:1 match. The candidate pass scores the
 //! invoices whose amount is within tolerance and whose due date is inside the date window.
+//! Groups are also searched by counterparty when the reference does not name them: the
+//! open invoices (or payments) of a similar payer, inside the date window, whose amounts add
+//! up to the payment (or invoice) within tolerance.
 //! Payments and invoices only match inside the same scope and currency.
 //!
 //! All monetary amounts are integers in minor units (for example cents), never
