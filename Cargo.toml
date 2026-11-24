@@ -1,0 +1,17 @@
+[workspace]
+members = ["crates/remitmatch", "crates/remitmatch-py"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/eamigo86/remitmatch"
+authors = ["Ernesto Pérez Amigo"]
+
+[workspace.lints.rust]
+missing_docs = "deny"
+
+[workspace.lints.clippy]
+missing_errors_doc = "deny"
+missing_panics_doc = "deny"

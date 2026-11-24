@@ -1,0 +1,63 @@
+[build-system]
+requires = ["maturin>=1.16,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "remitmatch"
+dynamic = ["version"]
+description = "Match bank payments to open invoices (1:1, 1:N, N:1) and explain every match with a per-signal score."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+authors = [{ name = "Ernesto Pérez Amigo" }]
+keywords = ["reconciliation", "invoices", "payments", "fintech", "pyo3"]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Office/Business :: Financial :: Accounting",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Repository = "https://github.com/eamigo86/remitmatch"
+RFC = "https://github.com/eamigo86/remitmatch/blob/main/docs/rfc/0001-remitmatch.md"
+
+[tool.maturin]
+manifest-path = "crates/remitmatch-py/Cargo.toml"
+python-source = "python"
+module-name = "remitmatch._core"
+
+[tool.uv]
+# Rebuild the extension when Rust sources or manifests change.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "**/Cargo.toml" },
+    { file = "**/*.rs" },
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "D", "ANN"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.mypy]
+strict = true
+
+[[tool.mypy.overrides]]
+module = "pyarrow.*"
+ignore_missing_imports = true
+
+[dependency-groups]
+dev = [
+    "maturin>=1.16.0",
+    "mypy>=2.4.1",
+    "pytest>=9.2.0",
+    "ruff>=0.17.6",
+]

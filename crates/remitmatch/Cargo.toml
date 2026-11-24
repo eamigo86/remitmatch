@@ -1,0 +1,17 @@
+[package]
+name = "remitmatch"
+description = "Match bank payments to open invoices (1:1, 1:N, N:1) and explain every match with a per-signal score."
+readme = "../../README.md"
+keywords = ["reconciliation", "invoices", "payments", "fintech", "pyo3"]
+categories = ["finance", "algorithms"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false }
+
+[lints]
+workspace = true
