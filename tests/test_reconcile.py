@@ -159,14 +159,22 @@ def test_invalid_config_raises_value_error() -> None:
 
 @pytest.mark.parametrize("bad", [None, 5, "text", {"i1": 1}, {inv("i1", "INV-1", 1)}])
 def test_invoices_must_be_a_sequence_of_invoices(bad: object) -> None:
-    """Anything but a sequence of Invoice objects raises TypeError."""
+    """Anything but a sequence of Invoice objects raises TypeError.
+
+    Args:
+        bad: A value that is not a sequence of invoices.
+    """
     with pytest.raises(TypeError):
         reconcile(bad, [])  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("bad", [None, 5, "text", {"p1": 1}])
 def test_payments_must_be_a_sequence_of_payments(bad: object) -> None:
-    """Anything but a sequence of Payment objects raises TypeError."""
+    """Anything but a sequence of Payment objects raises TypeError.
+
+    Args:
+        bad: A value that is not a sequence of payments.
+    """
     with pytest.raises(TypeError):
         reconcile([], bad)  # type: ignore[arg-type]
 

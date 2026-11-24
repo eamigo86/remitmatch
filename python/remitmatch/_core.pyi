@@ -36,15 +36,18 @@ def reconcile(
     match. The inputs are copied before matching starts.
 
     Args:
-        invoices: Open invoices to settle, as a list or tuple.
-        payments: Bank movements received, as a list or tuple.
+        invoices: Open invoices to settle, as a sequence such as a list or tuple. Any
+            sequence except a string is accepted.
+        payments: Bank movements received, as a sequence such as a list or tuple. Any
+            sequence except a string is accepted.
         config: Tolerances and thresholds; defaults to MatchConfig().
 
     Returns:
         Matches with per-signal breakdown, plus unmatched ids on each side.
 
     Raises:
-        ValueError: An id repeats on one side, or the config is invalid.
+        ValueError: An id repeats on one side, the config is invalid, or the reference index
+            cannot be built.
         TypeError: An input is not a sequence of the expected objects.
     """
 
@@ -61,6 +64,10 @@ class Invoice:
         due_date: Date payment is expected.
         counterparty: Customer name as stored in the ledger.
         scope: Partition key (company, account); different scopes never match.
+
+    Raises:
+        TypeError: An argument has the wrong type.
+        OverflowError: An integer argument is outside the accepted range.
     """
 
     def __new__(
@@ -120,6 +127,10 @@ class Payment:
         reference: Free-text remittance info / description from the bank.
         counterparty: Payer name as reported by the bank.
         scope: Partition key; must equal the invoice scope to match.
+
+    Raises:
+        TypeError: An argument has the wrong type.
+        OverflowError: An integer argument is outside the accepted range.
     """
 
     def __new__(
@@ -176,6 +187,10 @@ class MatchConfig:
         ambiguity_margin: If the best two candidates differ by less than this, flag ambiguous.
         weights: Relative weight of each signal in the final score; None selects the default
             weights.
+
+    Raises:
+        TypeError: An argument has the wrong type.
+        OverflowError: An integer argument is outside the accepted range.
     """
 
     def __new__(
@@ -214,7 +229,11 @@ class MatchConfig:
 
     @property
     def weights(self) -> dict[str, float]:
-        """Relative weight of each signal in the final score; a new dict on each access."""
+        """Relative weight of each signal in the final score.
+
+        Each access returns a new dict, so bind it to a variable before indexing
+        repeatedly.
+        """
 
     __hash__: None  # type: ignore[assignment]
 
@@ -232,7 +251,9 @@ class Match:
         residual_minor: Amount difference left after matching (fees, rounding).
 
     Raises:
-        TypeError: kind or status is not a member of the matching enum.
+        TypeError: kind or status is not a member of the matching enum, or another argument
+            has the wrong type.
+        OverflowError: An integer argument is outside the accepted range.
     """
 
     def __new__(
@@ -255,11 +276,19 @@ class Match:
 
     @property
     def payment_ids(self) -> tuple[str, ...]:
-        """Payments in the match."""
+        """Payments in the match.
+
+        Each access returns a new tuple, so bind it to a variable before indexing
+        repeatedly.
+        """
 
     @property
     def invoice_ids(self) -> tuple[str, ...]:
-        """Invoices in the match."""
+        """Invoices in the match.
+
+        Each access returns a new tuple, so bind it to a variable before indexing
+        repeatedly.
+        """
 
     @property
     def score(self) -> float:
@@ -267,7 +296,11 @@ class Match:
 
     @property
     def breakdown(self) -> dict[str, float]:
-        """Per-signal scores that explain the final score; a new dict on each access."""
+        """Per-signal scores that explain the final score.
+
+        Each access returns a new dict, so bind it to a variable before indexing
+        repeatedly.
+        """
 
     @property
     def residual_minor(self) -> int:
@@ -283,6 +316,9 @@ class ReconciliationResult:
         matches: Proposed matches, best score first.
         unmatched_payments: Payment ids with no acceptable candidate.
         unmatched_invoices: Invoice ids with no acceptable candidate.
+
+    Raises:
+        TypeError: An argument has the wrong type.
     """
 
     def __new__(
@@ -293,15 +329,27 @@ class ReconciliationResult:
     ) -> Self: ...
     @property
     def matches(self) -> list[Match]:
-        """Proposed matches, best score first; a new list on each access."""
+        """Proposed matches, best score first.
+
+        Each access returns a new list, so bind it to a variable before indexing
+        repeatedly.
+        """
 
     @property
     def unmatched_payments(self) -> list[str]:
-        """Payment ids with no acceptable candidate; a new list on each access."""
+        """Payment ids with no acceptable candidate.
+
+        Each access returns a new list, so bind it to a variable before indexing
+        repeatedly.
+        """
 
     @property
     def unmatched_invoices(self) -> list[str]:
-        """Invoice ids with no acceptable candidate; a new list on each access."""
+        """Invoice ids with no acceptable candidate.
+
+        Each access returns a new list, so bind it to a variable before indexing
+        repeatedly.
+        """
 
     def to_arrow(self) -> pyarrow.Table:
         """Return matches as a flat Arrow table (one row per payment-invoice pair).
