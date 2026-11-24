@@ -7,6 +7,9 @@ incoming payment to the invoices it settles.
 
 **Status:** name reserved, under active development
 
+1:1 matching exists in the Rust core on the development branch. The published 0.0.1 still
+only reserves the name.
+
 The design is described in
 [RFC 0001](https://github.com/eamigo86/remitmatch/blob/main/docs/rfc/0001-remitmatch.md).
 
