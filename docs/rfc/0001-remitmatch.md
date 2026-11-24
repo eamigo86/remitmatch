@@ -222,34 +222,39 @@ def reconcile(
 
     Returns:
         Matches with per-signal breakdown, plus unmatched ids on each side.
+
+    Raises:
+        ValueError: An id repeats on one side, or the config is invalid.
     """
     ...
 ```
 
 Usage example: `result = reconcile(invoices, payments, MatchConfig(amount_tolerance_minor=150))`.
 
+The Rust core exposes the same contract as `remitmatch::reconcile(&[Invoice], &[Payment], &MatchConfig) -> Result<ReconciliationResult, Error>`.
+
 ## Matching algorithm
 
 The engine works in passes, from safest to most expensive: whatever one pass matches is removed from the next, so the group search only sees what's still unmatched.
 
 1. **Normalize and partition.** References uppercased with spaces and dashes removed; names without accents or company suffixes (S.L., LLC, Inc.). Data is grouped by `(scope, currency)` and each partition is processed in parallel.
-2. **Reference pass.** An Aho-Corasick automaton built from the open invoice numbers finds, in a single scan, every invoice each description mentions. One invoice mentioned and the amount fits → 1:1. Several mentioned and the sum fits → 1:N.
-3. **1:1 candidates.** An index sorted by amount returns only the invoices within tolerance; those are then filtered by date window and scored. This avoids comparing everything against everything.
+2. **Reference pass.** An Aho-Corasick automaton built from the open invoice numbers finds, in a single scan, every invoice each description mentions. One invoice mentioned and the amount fits → 1:1. Several mentioned and the sum fits → 1:N. A number is not a mention when it is glued to another digit, so `INV-1` is not found inside `INV-10`; whitespace counts as a boundary. This pass does not apply the date window.
+3. **1:1 candidates.** An index sorted by amount returns only the invoices within tolerance; those are then filtered by date window and scored. This avoids comparing everything against everything. Fuzzy reference similarity is not used for a payment whose reference already names an open invoice exactly.
 4. **1:N groups.** For each unmatched payment: open invoices from the same counterparty (name above the threshold) and within the window. The engine looks for a subset whose sum equals the payment amount ± tolerance, with at most `max_group_size` invoices.
    1. It's a *subset-sum* variant: bounded by a maximum number of candidates (e.g. 24) and solved with *meet-in-the-middle*; if there are more, the oldest invoices take priority.
    2. If more than one subset is valid, the match is flagged `ambiguous`.
 5. **N:1 groups.** The same in reverse: unmatched payments from the same counterparty whose sum covers one invoice (partial payments).
-6. **Global assignment.** All candidates are sorted by score and accepted greedily when none of their ids is already taken. If a payment's second-best candidate is within `ambiguity_margin`, the status is `ambiguous`, never `auto`.
+6. **Global assignment.** All candidates are sorted by score and accepted greedily when none of their ids is already taken. If a payment's second-best candidate is within `ambiguity_margin`, the status is `ambiguous`, never `auto`. Ambiguity is evaluated per pass. Rows with a non-positive amount never match.
 7. **Final status.** `auto` if the score is above `auto_threshold` and not ambiguous; `suggested` if above `suggest_threshold`; everything else stays unmatched.
 
-**Scoring.** A weighted sum of four signals in [0, 1], also returned individually in `breakdown`:
+**Scoring.** A weighted sum of four signals in [0, 1], also returned individually in `breakdown`. The weighted sum is divided by the sum of the weights:
 
 | Signal | How it's computed | Default weight |
 | --- | --- | --- |
-| Reference | 1 if the exact number appears; partial if it appears with high similarity | 0.45 |
+| Reference | 1 if the exact number appears; partial if a sliding window of the reference has a normalized Damerau-Levenshtein similarity of at least 0.8 (numbers shorter than 4 characters get no partial score) | 0.45 |
 | Amount | 1 if exact; decreases linearly to 0 at the tolerance limit | 0.30 |
 | Name | Jaro-Winkler on normalized names | 0.15 |
-| Date | 1 within the first few days; decreases linearly to the end of the window | 0.10 |
+| Date | 1 within 3 days of the due date; decreases linearly to the end of the window | 0.10 |
 
 Greedy assignment is enough for v1; the Hungarian algorithm for optimal 1:1 assignment is a follow-up improvement measured in the benchmarks.
 
@@ -278,6 +283,7 @@ remitmatch/
 | Parallelism | rayon, one task per partition | Scales with cores; the GIL is released for the whole computation |
 | References | `aho-corasick` crate | Searches thousands of invoice numbers in one pass |
 | Similarity | `strsim` crate (Jaro-Winkler) | Simple, no heavy dependencies |
+| Name normalization | `unicode-normalization` crate | Accent stripping for names |
 | Arrow | `arrow-rs` + PyCapsule interface | Zero-copy input and output from Polars or pandas |
 | CI | GitHub Actions + `maturin-action` | Rust and Python tests, per-platform wheels |
 | Publishing | PyPI Trusted Publishing | No tokens; same flow as my other packages |
@@ -341,7 +347,8 @@ If week 4 runs long, 0.1.0 ships with 1:1 and 1:N only, and N:1 moves to 0.2.0.
 **Open decisions**
 
 - [x] Reserve the name by publishing an empty 0.0.1 on PyPI and crates.io (done 2026-11-24)
-- [ ] Default scoring weights: tune them with the generator data
+- [ ] Default scoring weights: tune them with the generator data. With the current defaults, a payment without a reference signal can score at most 0.55, below the 0.60 suggest threshold, and an amount at the tolerance limit scores 0
+- [ ] Percentage amount tolerance is listed in Scope v1, but `MatchConfig` has no field for it yet
 - [ ] Candidate limit for the group search (24 is an initial estimate)
 - [x] License: MIT OR Apache-2.0 (dual, as is common in Rust)
 
