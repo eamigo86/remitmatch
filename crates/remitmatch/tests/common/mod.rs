@@ -3,8 +3,6 @@
 // Each integration test file compiles this module as its own crate and uses only part of it.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
-
 use chrono::{Days, NaiveDate};
 use remitmatch::{Invoice, Payment};
 
@@ -22,6 +20,10 @@ pub struct Noise {
     pub unpaid: f64,
     /// Extra payments (as a fraction of the invoice count) that settle nothing.
     pub unrelated: f64,
+    /// An invoice joins a batch of 2 to 4 invoices that its customer pays with one payment.
+    pub grouped: f64,
+    /// An invoice is paid by 2 or 3 payments that add up to its amount.
+    pub partial: f64,
 }
 
 impl Noise {
@@ -34,6 +36,8 @@ impl Noise {
             abbreviated_name: 0.0,
             unpaid: 0.0,
             unrelated: 0.0,
+            grouped: 0.0,
+            partial: 0.0,
         }
     }
 
@@ -46,6 +50,8 @@ impl Noise {
             abbreviated_name: 0.30,
             unpaid: 0.10,
             unrelated: 0.05,
+            grouped: 0.08,
+            partial: 0.05,
         }
     }
 }
@@ -54,8 +60,9 @@ impl Noise {
 pub struct Dataset {
     pub invoices: Vec<Invoice>,
     pub payments: Vec<Payment>,
-    /// Payment id to invoice id.
-    pub solution: BTreeMap<String, String>,
+    /// The true groups as (payment ids, invoice ids), each list sorted ascending.
+    /// A one-to-one payment is a group of one payment and one invoice.
+    pub solution: Vec<(Vec<String>, Vec<String>)>,
 }
 
 /// SplitMix64, enough for reproducible test data without a `rand` dependency.
@@ -225,31 +232,221 @@ fn reference(rng: &mut Rng, number: &str, short_name: &str, noise: &Noise) -> St
     }
 }
 
+/// A customer's open batch of invoices (indices into the invoice list) and its target size.
+struct Batch {
+    members: Vec<usize>,
+    target: usize,
+}
+
+fn shift(date: NaiveDate, days: i64) -> NaiveDate {
+    if days >= 0 {
+        date + Days::new(days as u64)
+    } else {
+        date - Days::new(days.unsigned_abs())
+    }
+}
+
+/// Payer name as the bank reports it: abbreviated with the given probability.
+fn payer(rng: &mut Rng, c: &Customer, noise: &Noise) -> String {
+    if rng.chance(noise.abbreviated_name) {
+        c.bank_name.clone()
+    } else {
+        c.name.clone()
+    }
+}
+
+/// First word of the customer's bank name, used in one reference style.
+fn short_name(c: &Customer) -> String {
+    c.bank_name.split(' ').next().unwrap_or_default().to_owned()
+}
+
+/// Appends a payment of the customer and returns its id.
+fn push_payment(
+    payments: &mut Vec<Payment>,
+    c: &Customer,
+    amount_minor: i64,
+    value_date: NaiveDate,
+    reference: String,
+    counterparty: String,
+) -> String {
+    let id = format!("P-{:05}", payments.len());
+    payments.push(Payment {
+        id: id.clone(),
+        amount_minor,
+        currency: c.currency.to_owned(),
+        value_date,
+        reference,
+        counterparty,
+        scope: c.scope.to_owned(),
+    });
+    id
+}
+
+/// Value date: usually close to the due date, sometimes very late.
+fn late_offset(rng: &mut Rng) -> i64 {
+    if rng.chance(0.05) {
+        rng.range(0, 60)
+    } else {
+        rng.range(-10, 25)
+    }
+}
+
+/// Pays one invoice with one payment.
+fn pay_single(
+    rng: &mut Rng,
+    c: &Customer,
+    noise: &Noise,
+    invoice: &Invoice,
+    payments: &mut Vec<Payment>,
+    solution: &mut Vec<(Vec<String>, Vec<String>)>,
+) {
+    let paid = if rng.chance(noise.fee) {
+        invoice.amount_minor - rng.range(1, 300)
+    } else {
+        invoice.amount_minor
+    };
+    let offset = late_offset(rng);
+    let reference = reference(rng, &invoice.number, &short_name(c), noise);
+    let name = payer(rng, c, noise);
+    let id = push_payment(
+        payments,
+        c,
+        paid,
+        shift(invoice.due_date, offset),
+        reference,
+        name,
+    );
+    solution.push((vec![id], vec![invoice.id.clone()]));
+}
+
+/// Pays one invoice with 2 or 3 payments, each at least 10% of the amount.
+///
+/// The fee, when it fires, is taken from the last part (capped so the part stays positive).
+fn pay_partial(
+    rng: &mut Rng,
+    c: &Customer,
+    noise: &Noise,
+    invoice: &Invoice,
+    payments: &mut Vec<Payment>,
+    solution: &mut Vec<(Vec<String>, Vec<String>)>,
+) {
+    let parts = 2 + rng.below(2);
+    let min_part = (invoice.amount_minor + 9) / 10;
+    let mut remaining = invoice.amount_minor;
+    let mut amounts = Vec::new();
+    for left in (1..parts).rev() {
+        let part = rng.range(min_part, remaining - min_part * left as i64);
+        amounts.push(part);
+        remaining -= part;
+    }
+    amounts.push(remaining);
+    if rng.chance(noise.fee) {
+        let last = amounts.last_mut().unwrap_or(&mut remaining);
+        *last -= rng.range(1, 300.min(*last - 1));
+    }
+    let mut ids = Vec::new();
+    for amount in amounts {
+        let offset = rng.range(-10, 25);
+        let reference = reference(rng, &invoice.number, &short_name(c), noise);
+        let name = payer(rng, c, noise);
+        ids.push(push_payment(
+            payments,
+            c,
+            amount,
+            shift(invoice.due_date, offset),
+            reference,
+            name,
+        ));
+    }
+    ids.sort();
+    solution.push((ids, vec![invoice.id.clone()]));
+}
+
+/// Pays a batch of invoices with one payment that lists every number.
+fn pay_batch(
+    rng: &mut Rng,
+    c: &Customer,
+    noise: &Noise,
+    members: &[&Invoice],
+    payments: &mut Vec<Payment>,
+    solution: &mut Vec<(Vec<String>, Vec<String>)>,
+) {
+    let mut total: i64 = members.iter().map(|i| i.amount_minor).sum();
+    if rng.chance(noise.fee) {
+        total -= rng.range(1, 300);
+    }
+    let last_due = members.iter().map(|i| i.due_date).max().unwrap_or_default();
+    let offset = late_offset(rng);
+    let reference = if rng.chance(noise.missing_reference) {
+        format!("TRANSFER {:06}", rng.below(1_000_000))
+    } else {
+        let style = rng.below(3);
+        let numbers: Vec<String> = members
+            .iter()
+            .map(|i| {
+                let mut compact: Vec<char> = i.number.chars().filter(|c| *c != '-').collect();
+                if rng.chance(noise.typo) {
+                    typo(rng, &mut compact);
+                }
+                render_number(&compact, style)
+            })
+            .collect();
+        format!("Payment {}", numbers.join(" "))
+    };
+    let name = payer(rng, c, noise);
+    let id = push_payment(payments, c, total, shift(last_due, offset), reference, name);
+    let mut invoice_ids: Vec<String> = members.iter().map(|i| i.id.clone()).collect();
+    invoice_ids.sort();
+    solution.push((vec![id], invoice_ids));
+}
+
+/// Closes a batch: one payment for two or more members, a plain single payment for one.
+fn close_batch(
+    rng: &mut Rng,
+    c: &Customer,
+    noise: &Noise,
+    invoices: &[Invoice],
+    batch: &Batch,
+    payments: &mut Vec<Payment>,
+    solution: &mut Vec<(Vec<String>, Vec<String>)>,
+) {
+    let members: Vec<&Invoice> = batch.members.iter().map(|&k| &invoices[k]).collect();
+    if let [only] = members.as_slice() {
+        pay_single(rng, c, noise, only, payments, solution);
+    } else {
+        pay_batch(rng, c, noise, &members, payments, solution);
+    }
+}
+
 /// Generates a reproducible dataset with the given noise; the same seed gives the same data.
+///
+/// Per invoice, in order: unpaid, else paid in parts, else joined to a batch, else paid by
+/// one payment.
 pub fn generate(seed: u64, n_invoices: usize, noise: &Noise) -> Dataset {
     let mut rng = Rng(seed);
     let customers: Vec<Customer> = (0..(n_invoices / 10).max(1))
         .map(|_| customer(&mut rng))
         .collect();
     let base = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
-    let shift = |date: NaiveDate, days: i64| {
-        if days >= 0 {
-            date + Days::new(days as u64)
-        } else {
-            date - Days::new(days.unsigned_abs())
-        }
-    };
 
-    let mut invoices = Vec::new();
+    let mut invoices: Vec<Invoice> = Vec::new();
     let mut payments = Vec::new();
-    let mut solution = BTreeMap::new();
+    let mut solution = Vec::new();
+    let mut batches: Vec<Option<Batch>> = customers.iter().map(|_| None).collect();
     for n in 0..n_invoices {
-        let c = &customers[rng.below(customers.len())];
-        let due = shift(base, rng.range(0, 364));
+        let ci = rng.below(customers.len());
+        let c = &customers[ci];
+        let unpaid = rng.chance(noise.unpaid);
+        let partial = !unpaid && rng.chance(noise.partial);
+        let grouped = !unpaid && !partial && rng.chance(noise.grouped);
+        let due = match &batches[ci] {
+            Some(batch) if grouped => shift(invoices[batch.members[0]].due_date, rng.range(0, 20)),
+            _ => shift(base, rng.range(0, 364)),
+        };
         let amount = c
             .fixed_amount
             .unwrap_or_else(|| rng.range(1_000, 5_000_000));
-        let invoice = Invoice {
+        invoices.push(Invoice {
             id: format!("I-{n:05}"),
             number: format!("INV-2024-{:05}", n + 1),
             amount_minor: amount,
@@ -258,48 +455,55 @@ pub fn generate(seed: u64, n_invoices: usize, noise: &Noise) -> Dataset {
             due_date: due,
             counterparty: c.name.clone(),
             scope: c.scope.to_owned(),
-        };
-        if !rng.chance(noise.unpaid) {
-            let paid = if rng.chance(noise.fee) {
-                amount - rng.range(1, 300)
-            } else {
-                amount
-            };
-            let offset = if rng.chance(0.05) {
-                rng.range(0, 60)
-            } else {
-                rng.range(-10, 25)
-            };
-            let short = c.bank_name.split(' ').next().unwrap_or_default().to_owned();
-            let payment = Payment {
-                id: format!("P-{:05}", payments.len()),
-                amount_minor: paid,
-                currency: c.currency.to_owned(),
-                value_date: shift(due, offset),
-                reference: reference(&mut rng, &invoice.number, &short, noise),
-                counterparty: if rng.chance(noise.abbreviated_name) {
-                    c.bank_name.clone()
-                } else {
-                    c.name.clone()
-                },
-                scope: c.scope.to_owned(),
-            };
-            solution.insert(payment.id.clone(), invoice.id.clone());
-            payments.push(payment);
+        });
+        let invoice = &invoices[n];
+        if unpaid {
+            continue;
         }
-        invoices.push(invoice);
+        if partial {
+            pay_partial(&mut rng, c, noise, invoice, &mut payments, &mut solution);
+        } else if grouped {
+            let batch = batches[ci].get_or_insert_with(|| Batch {
+                members: Vec::new(),
+                target: 2 + rng.below(3),
+            });
+            batch.members.push(n);
+            let full = batch.members.len() == batch.target;
+            if let Some(batch) = batches[ci].take_if(|_| full) {
+                close_batch(
+                    &mut rng,
+                    c,
+                    noise,
+                    &invoices,
+                    &batch,
+                    &mut payments,
+                    &mut solution,
+                );
+            }
+        } else {
+            pay_single(&mut rng, c, noise, invoice, &mut payments, &mut solution);
+        }
+    }
+    for (ci, batch) in batches.into_iter().enumerate() {
+        if let Some(batch) = batch {
+            let c = &customers[ci];
+            close_batch(
+                &mut rng,
+                c,
+                noise,
+                &invoices,
+                &batch,
+                &mut payments,
+                &mut solution,
+            );
+        }
     }
     for _ in 0..(n_invoices as f64 * noise.unrelated).round() as usize {
         let c = &customers[rng.below(customers.len())];
-        payments.push(Payment {
-            id: format!("P-{:05}", payments.len()),
-            amount_minor: rng.range(1_000, 5_000_000),
-            currency: c.currency.to_owned(),
-            value_date: shift(base, rng.range(0, 364)),
-            reference: format!("TRANSFER {:06}", rng.below(1_000_000)),
-            counterparty: c.name.clone(),
-            scope: c.scope.to_owned(),
-        });
+        let amount = rng.range(1_000, 5_000_000);
+        let date = shift(base, rng.range(0, 364));
+        let reference = format!("TRANSFER {:06}", rng.below(1_000_000));
+        push_payment(&mut payments, c, amount, date, reference, c.name.clone());
     }
     // Fisher-Yates, so input order carries no information.
     for i in (1..payments.len()).rev() {
