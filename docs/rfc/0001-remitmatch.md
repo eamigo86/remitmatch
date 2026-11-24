@@ -232,10 +232,11 @@ def reconcile(
 
 Implementation notes for the Python API as shipped on the development branch:
 
-- The dataclass notation above documents the fields, their order and their defaults. The runtime types are native classes (`#[pyclass(frozen)]`), not dataclasses: they take positional or keyword arguments, expose read-only attributes, compare field by field, and `Invoice` and `Payment` are hashable. `MatchConfig`, `Match` and `ReconciliationResult` are not hashable, as a frozen dataclass holding a dict or list would not be. The `dataclasses` helpers (`fields`, `replace`, `asdict`) and pickling are not supported.
+- The dataclass notation above documents the fields, their order and their defaults. The runtime types are native classes (`#[pyclass(frozen)]`), not dataclasses: they take positional or keyword arguments, expose read-only attributes, compare field by field, and `Invoice` and `Payment` are hashable. `MatchConfig`, `Match` and `ReconciliationResult` are not hashable, as a frozen dataclass holding a dict or list would not be. The `dataclasses` helpers (`fields`, `replace`, `asdict`) are not supported; `copy.copy`, `copy.deepcopy` and `pickle` are, through `__reduce__`. There is no `__match_args__`, so keyword patterns work in `match` statements and positional ones do not.
+- `MatchConfig.weights` and `Match.breakdown` come back with their keys in alphabetical order, not in insertion order.
 - `MatchKind` and `MatchStatus` are real `enum.Enum` classes defined in Python; `Match.kind` and `Match.status` return their members. `MatchConfig.weights=None` selects the default weights.
 - `MatchConfig.weights` and `Match.breakdown` return a new `dict` on each access, `Match.payment_ids` and `Match.invoice_ids` are tuples, and the lists of a `ReconciliationResult` are new lists on each access.
-- `reconcile` accepts sequences (lists or tuples) of `Invoice` and `Payment` objects, copies them into core structs and runs the core with the GIL released. Errors from the core surface as `ValueError` with the core message (repeated ids, invalid configuration, reference index); an input that is not a sequence of the expected objects raises `TypeError`; an integer that does not fit the native type (for example a negative `date_window_days`) raises `OverflowError`.
+- `reconcile` accepts sequences (lists or tuples) of `Invoice` and `Payment` objects, copies them into core structs and runs the core with the GIL released. Errors from the core surface as `ValueError` with the core message (repeated ids, invalid configuration, reference index); an input that is not a sequence of the expected objects raises `TypeError`; an integer that does not fit the native type (for example a negative `date_window_days`) raises `OverflowError`. `TypeError` and `OverflowError` for bad argument values are raised when the objects are constructed, not by `reconcile`. A running `reconcile` does not react to Ctrl-C until it returns, because the GIL is released and the core has no cancellation point.
 - `ReconciliationResult.to_arrow()` exists and raises `NotImplementedError`; Arrow table input and Arrow output arrive in a later change, together with the choice between `pyarrow` and `arrow-rs` through the PyCapsule interface.
 
 Usage example: `result = reconcile(invoices, payments, MatchConfig(amount_tolerance_minor=150))`.
@@ -255,7 +256,7 @@ The engine works in passes, from safest to most expensive: whatever one pass mat
    3. Anchors are taken oldest first (payments by value date), and each anchor chooses among the rows still free after the previous anchors were assigned, instead of one global sort across anchors.
 5. **N:1 groups.** The same in reverse: unmatched payments from the same counterparty (name, window and amount filters mirrored) whose sum equals one invoice amount ± tolerance. A group is proposed only when the sum fits, so partial payments that do not yet add up stay unmatched. Invoices are the anchors, taken oldest first by due date, and each chooses among the payments still free; the 24-row limit and the `ambiguous` rule for truncated pools apply as in step 4.
 6. **Global assignment.** All candidates are sorted by score and accepted greedily when none of their ids is already taken. If an anchor's second-best candidate is within `ambiguity_margin`, the status is `ambiguous`, never `auto`. The anchor is the payment for 1:1 and 1:N, and the invoice for N:1. Ambiguity is evaluated per pass. Rows with a non-positive amount never match.
-7. **Final status.** `auto` if the score is above `auto_threshold` and not ambiguous; `suggested` if above `suggest_threshold`; everything else stays unmatched.
+7. **Final status.** `auto` if the score is at or above `auto_threshold` and not ambiguous; `suggested` if at or above `suggest_threshold`; everything else stays unmatched.
 
 **Scoring.** A weighted sum of four signals in [0, 1], also returned individually in `breakdown`. The weighted sum is divided by the sum of the weights:
 
@@ -367,6 +368,8 @@ If week 4 runs long, 0.1.0 ships with 1:1 and 1:N only, and N:1 moves to 0.2.0.
 - [ ] Candidate limit for the group search (24 is an initial estimate)
 - [ ] The per-payment time budget from the risk table is not implemented; the group search is bounded by the 24-candidate and 32-subset limits instead
 - [ ] Conflicts across anchors are resolved by pass order and score without flagging ambiguity: for example a 1:1 match and an N:1 group competing for the same invoice, or an exact group losing to a 1:1 match with a residual found by an earlier pass
+- [ ] No length cap on invoice numbers and counterparty names; the comparison cost grows quadratically with length (a 16,000-character field takes seconds)
+- [ ] Measured in a release build without rayon: 10,000 invoices and payments take about 1.4 to 1.8 s and 100,000 take about 58 s, against the 5 s target for 100,000; address it in the benchmarks milestone
 - [x] License: MIT OR Apache-2.0 (dual, as is common in Rust)
 
 ## Alternatives considered
