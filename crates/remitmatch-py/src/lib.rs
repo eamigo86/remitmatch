@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use chrono::NaiveDate;
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::{PyNotImplementedError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyTuple, PyType};
@@ -580,6 +580,19 @@ impl PyReconciliationResult {
         self.0.unmatched_invoices.clone()
     }
 
+    /// Return matches as a flat Arrow table (one row per payment-invoice pair).
+    ///
+    /// Returns:
+    ///     A table with one row for each payment-invoice pair in every match.
+    ///
+    /// Raises:
+    ///     NotImplementedError: Always, because Arrow output is planned for a later release.
+    fn to_arrow(&self) -> PyResult<()> {
+        Err(PyNotImplementedError::new_err(
+            "Arrow output is planned for a later release",
+        ))
+    }
+
     fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
         repr_fields(
             slf.as_any(),
@@ -589,13 +602,47 @@ impl PyReconciliationResult {
     }
 }
 
+/// Match payments against open invoices.
+///
+/// Runs in Rust and releases the GIL. Each invoice and payment appears in at most one
+/// match. The inputs are copied before matching starts.
+///
+/// Args:
+///     invoices: Open invoices to settle, as a list or tuple.
+///     payments: Bank movements received, as a list or tuple.
+///     config: Tolerances and thresholds; defaults to MatchConfig().
+///
+/// Returns:
+///     Matches with per-signal breakdown, plus unmatched ids on each side.
+///
+/// Raises:
+///     ValueError: An id repeats on one side, or the config is invalid.
+///     TypeError: An input is not a sequence of the expected objects.
+#[pyfunction]
+#[pyo3(signature = (invoices, payments, config=None))]
+fn reconcile(
+    py: Python<'_>,
+    invoices: Vec<PyInvoice>,
+    payments: Vec<PyPayment>,
+    config: Option<PyMatchConfig>,
+) -> PyResult<PyReconciliationResult> {
+    // ponytail: inputs are copied into core structs (and results copied back), O(n) extra
+    // memory; borrow from the frozen Python objects instead if copies ever dominate the run.
+    let invoices: Vec<Invoice> = invoices.into_iter().map(|i| i.0).collect();
+    let payments: Vec<Payment> = payments.into_iter().map(|p| p.0).collect();
+    let config = config.map_or_else(MatchConfig::default, |c| c.0);
+    py.detach(|| remitmatch::reconcile(&invoices, &payments, &config))
+        .map(PyReconciliationResult)
+        .map_err(|error| PyValueError::new_err(error.to_string()))
+}
+
 /// Native extension module for remitmatch. Not part of the public API.
 #[pymodule]
 mod _core {
     use pyo3::prelude::*;
 
     #[pymodule_export]
-    use super::{PyInvoice, PyMatch, PyMatchConfig, PyPayment, PyReconciliationResult};
+    use super::{PyInvoice, PyMatch, PyMatchConfig, PyPayment, PyReconciliationResult, reconcile};
 
     /// Return the version of the native core.
     ///
