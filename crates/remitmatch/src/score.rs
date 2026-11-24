@@ -80,14 +80,17 @@ pub(crate) fn date_signal(value_date: NaiveDate, due_date: NaiveDate, window_day
 
 /// Finds the best approximate occurrence of `number` inside `reference`.
 ///
-/// Both arguments are normalized. Exact occurrences are skipped: the caller already accepted
-/// or rejected them as mentions, and a rejected one must stay a partial signal. Returns the
+/// Both arguments are normalized. Returns 0 when `number` occurs exactly: the caller only
+/// gets here for payments with no accepted mention, so an exact occurrence was rejected by
+/// the digit-boundary rule and names a different, longer number. Otherwise returns the best
 /// similarity when it reaches the floor, else 0.
-// ponytail: naive sliding window, O(len(reference) * len(number)) per candidate; build a
-// q-gram index per partition if long references dominate the benchmarks.
+// ponytail: naive sliding window, O(len(reference) * len(number)^2) per candidate with an
+// allocation per window (about 66 microseconds per pair in a release build; 400 x 400
+// same-amount rows took 10.6 s). Upgrade: one approximate-substring DP (Sellers) per pair,
+// and do not materialize candidates below the suggest threshold.
 pub(crate) fn fuzzy_reference_signal(number: &str, reference: &str) -> f64 {
     let n = number.chars().count();
-    if n < FUZZY_MIN_LEN {
+    if n < FUZZY_MIN_LEN || reference.contains(number) {
         return 0.0;
     }
     let chars: Vec<char> = reference.chars().collect();
@@ -95,9 +98,6 @@ pub(crate) fn fuzzy_reference_signal(number: &str, reference: &str) -> f64 {
     for len in (n - 1)..=(n + 1) {
         for window in chars.windows(len) {
             let candidate: String = window.iter().collect();
-            if candidate == number {
-                continue;
-            }
             best = best.max(strsim::normalized_damerau_levenshtein(number, &candidate));
         }
     }
@@ -198,11 +198,11 @@ mod tests {
     }
 
     #[test]
-    fn fuzzy_reference_never_scores_an_exact_occurrence_as_one() {
+    fn fuzzy_reference_is_zero_when_the_number_occurs_exactly() {
         // An exact occurrence that reaches the fuzzy path was rejected as a mention
-        // (it splits a digit run), so it must stay a partial signal.
-        let s = fuzzy_reference_signal("INV1", "INV10");
-        assert!(s < 1.0, "got {s}");
+        // (it is glued to other digits), so it names a different, longer number.
+        assert!(close(fuzzy_reference_signal("INV1", "INV10"), 0.0));
+        assert!(close(fuzzy_reference_signal("1001", "PAGOFRA10010"), 0.0));
     }
 
     #[test]
