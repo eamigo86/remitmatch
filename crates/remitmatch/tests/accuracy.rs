@@ -228,4 +228,13 @@ fn realistic_noise_keeps_auto_precision_high() {
     assert!(stats.auto > 0, "no auto matches at all");
     let precision = stats.correct_auto as f64 / stats.auto as f64;
     assert!(precision >= 0.99, "auto precision {precision}");
+    for (_, label) in KINDS {
+        let k = stats.by_kind.get(label).copied().unwrap_or_default();
+        assert!(k.auto > 0, "no auto matches of kind {label}");
+        let precision = (k.auto - k.wrong_auto) as f64 / k.auto as f64;
+        assert!(
+            precision >= 0.99,
+            "auto precision of kind {label}: {precision}"
+        );
+    }
 }
