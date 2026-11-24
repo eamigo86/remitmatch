@@ -568,3 +568,246 @@ fn candidates_closer_than_the_margin_stay_ambiguous() {
     let r = contested_invoice(&config);
     assert_eq!(status_of(&r, "p2"), MatchStatus::Ambiguous);
 }
+
+fn breakdown_keys(m: &remitmatch::Match) -> Vec<&str> {
+    m.breakdown.keys().map(String::as_str).collect()
+}
+
+#[test]
+fn payment_naming_two_invoices_is_one_to_many_in_input_order() {
+    let r = run(
+        &[inv("i1", "INV-1", 6_000), inv("i2", "INV-2", 4_000)],
+        &[pay("p1", 10_000, "INV-2 INV-1")],
+        &MatchConfig::default(),
+    );
+    assert_eq!(r.matches.len(), 1);
+    let m = &r.matches[0];
+    assert_eq!(m.kind, MatchKind::OneToMany);
+    assert_eq!(m.status, MatchStatus::Auto);
+    assert_eq!(m.payment_ids, vec!["p1"]);
+    assert_eq!(m.invoice_ids, vec!["i1", "i2"]);
+    assert_eq!(m.residual_minor, 0);
+    assert_eq!(
+        breakdown_keys(m),
+        vec!["amount", "date", "name", "reference"]
+    );
+    assert!(close(m.breakdown["reference"], 1.0));
+    assert!(close(m.score, 1.0));
+    assert!(r.unmatched_payments.is_empty() && r.unmatched_invoices.is_empty());
+}
+
+#[test]
+fn group_fee_within_tolerance_gives_a_negative_residual() {
+    let config = MatchConfig {
+        amount_tolerance_minor: 150,
+        ..MatchConfig::default()
+    };
+    let r = run(
+        &[inv("i1", "INV-1", 6_000), inv("i2", "INV-2", 4_000)],
+        &[pay("p1", 9_970, "INV-1 INV-2")],
+        &config,
+    );
+    assert_eq!(r.matches.len(), 1);
+    let m = &r.matches[0];
+    assert_eq!(m.kind, MatchKind::OneToMany);
+    assert_eq!(m.residual_minor, -30);
+    assert!(close(m.breakdown["amount"], 0.8));
+    assert_eq!(m.status, MatchStatus::Auto);
+}
+
+#[test]
+fn three_mentioned_invoices_where_only_two_add_up_match_those_two() {
+    let r = run(
+        &[
+            inv("i1", "INV-1", 6_000),
+            inv("i2", "INV-2", 4_000),
+            inv("i3", "INV-3", 7_000),
+        ],
+        &[pay("p1", 10_000, "INV-1 INV-2 INV-3")],
+        &MatchConfig::default(),
+    );
+    assert_eq!(r.matches.len(), 1);
+    assert_eq!(r.matches[0].invoice_ids, vec!["i1", "i2"]);
+    assert_eq!(r.matches[0].status, MatchStatus::Auto);
+    assert_eq!(r.unmatched_invoices, vec!["i3"]);
+}
+
+#[test]
+fn two_payments_citing_one_invoice_whose_sum_fits_are_many_to_one() {
+    let r = run(
+        &[inv("i1", "INV-1", 10_000)],
+        &[pay("p1", 4_000, "INV-1"), pay("p2", 6_000, "INV-1")],
+        &MatchConfig::default(),
+    );
+    assert_eq!(r.matches.len(), 1);
+    let m = &r.matches[0];
+    assert_eq!(m.kind, MatchKind::ManyToOne);
+    assert_eq!(m.status, MatchStatus::Auto);
+    assert_eq!(m.payment_ids, vec!["p1", "p2"]);
+    assert_eq!(m.invoice_ids, vec!["i1"]);
+    assert_eq!(m.residual_minor, 0);
+    assert!(close(m.breakdown["reference"], 1.0));
+    assert!(r.unmatched_payments.is_empty() && r.unmatched_invoices.is_empty());
+}
+
+#[test]
+fn partial_payments_that_do_not_add_up_stay_unmatched() {
+    let r = run(
+        &[inv("i1", "INV-1", 10_000)],
+        &[
+            pay("p1", 3_000, "INV-1"),
+            pay("p2", 3_000, "INV-1"),
+            pay("p3", 3_000, "INV-1"),
+        ],
+        &MatchConfig::default(),
+    );
+    assert!(r.matches.is_empty());
+    assert_eq!(r.unmatched_payments, vec!["p1", "p2", "p3"]);
+    assert_eq!(r.unmatched_invoices, vec!["i1"]);
+}
+
+#[test]
+fn identical_mentioned_invoices_make_the_group_ambiguous() {
+    let r = run(
+        &[
+            inv("i1", "INV-7", 5_000),
+            inv("i2", "INV-7", 5_000),
+            inv("i3", "INV-7", 5_000),
+        ],
+        &[pay("p1", 10_000, "INV-7")],
+        &MatchConfig::default(),
+    );
+    assert_eq!(r.matches.len(), 1);
+    let m = &r.matches[0];
+    assert_eq!(m.kind, MatchKind::OneToMany);
+    assert_eq!(m.status, MatchStatus::Ambiguous);
+    assert_eq!(m.invoice_ids, vec!["i1", "i2"]);
+    assert_eq!(r.unmatched_invoices, vec!["i3"]);
+}
+
+#[test]
+fn several_valid_subsets_are_ambiguous_even_with_zero_margin() {
+    // Different amounts, so the two best candidates differ in score only through the
+    // amount signal; the group rule alone must flag the match.
+    let config = MatchConfig {
+        ambiguity_margin: 0.0,
+        ..MatchConfig::default()
+    };
+    let r = run(
+        &[
+            inv("i1", "INV-1", 6_000),
+            inv("i2", "INV-2", 4_000),
+            inv("i3", "INV-3", 3_000),
+            inv("i4", "INV-4", 7_000),
+        ],
+        &[pay("p1", 10_000, "INV-1 INV-2 INV-3 INV-4")],
+        &config,
+    );
+    assert_eq!(r.matches.len(), 1);
+    assert_eq!(r.matches[0].status, MatchStatus::Ambiguous);
+}
+
+#[test]
+fn max_group_size_two_blocks_a_group_of_three() {
+    let invoices = [
+        inv("i1", "INV-1", 3_000),
+        inv("i2", "INV-2", 3_000),
+        inv("i3", "INV-3", 4_000),
+    ];
+    let payments = [pay("p1", 10_000, "INV-1 INV-2 INV-3")];
+    let allowed = MatchConfig {
+        max_group_size: 3,
+        ..MatchConfig::default()
+    };
+    let r = run(&invoices, &payments, &allowed);
+    assert_eq!(r.matches.len(), 1);
+    assert_eq!(r.matches[0].invoice_ids, vec!["i1", "i2", "i3"]);
+    let blocked = MatchConfig {
+        max_group_size: 2,
+        ..MatchConfig::default()
+    };
+    let r = run(&invoices, &payments, &blocked);
+    assert!(r.matches.is_empty());
+    assert_eq!(r.unmatched_payments, vec!["p1"]);
+}
+
+#[test]
+fn max_group_size_below_two_disables_groups_but_not_one_to_one() {
+    let invoices = [
+        inv("i1", "INV-1", 6_000),
+        inv("i2", "INV-2", 4_000),
+        inv("i3", "INV-3", 5_000),
+    ];
+    let payments = [pay("p1", 10_000, "INV-1 INV-2"), pay("p2", 5_000, "INV-3")];
+    for max_group_size in [0, 1] {
+        let config = MatchConfig {
+            max_group_size,
+            ..MatchConfig::default()
+        };
+        let r = run(&invoices, &payments, &config);
+        assert_eq!(r.matches.len(), 1, "max_group_size {max_group_size}");
+        assert_eq!(r.matches[0].kind, MatchKind::OneToOne);
+        assert_eq!(r.matches[0].payment_ids, vec!["p2"]);
+        assert_eq!(r.unmatched_payments, vec!["p1"]);
+        assert_eq!(r.unmatched_invoices, vec!["i1", "i2"]);
+    }
+}
+
+#[test]
+fn a_group_never_crosses_scope_or_currency() {
+    let other_scope = Invoice {
+        scope: "other".to_owned(),
+        ..inv("i2", "INV-2", 4_000)
+    };
+    let other_currency = Invoice {
+        currency: "USD".to_owned(),
+        ..inv("i2", "INV-2", 4_000)
+    };
+    for second in [other_scope, other_currency] {
+        let r = run(
+            &[inv("i1", "INV-1", 6_000), second],
+            &[pay("p1", 10_000, "INV-1 INV-2")],
+            &MatchConfig::default(),
+        );
+        assert!(r.matches.is_empty());
+        assert_eq!(r.unmatched_payments, vec!["p1"]);
+        assert_eq!(r.unmatched_invoices, vec!["i1", "i2"]);
+    }
+}
+
+#[test]
+fn a_group_is_skipped_when_a_better_match_took_one_of_its_invoices() {
+    // p1 matches i1 one to one with a perfect score. p2 names i1 and i2; that group would
+    // score lower (i2 is due 40 days after the payment) and i1 is taken by then.
+    let late = Invoice {
+        due_date: day(50),
+        ..inv("i2", "INV-2", 4_000)
+    };
+    let r = run(
+        &[inv("i1", "INV-1", 6_000), late],
+        &[pay("p1", 6_000, "INV-1"), pay("p2", 10_000, "INV-1 INV-2")],
+        &MatchConfig::default(),
+    );
+    assert_eq!(r.matches.len(), 1);
+    assert_eq!(r.matches[0].kind, MatchKind::OneToOne);
+    assert_eq!(r.matches[0].payment_ids, vec!["p1"]);
+    assert_eq!(r.unmatched_payments, vec!["p2"]);
+    assert_eq!(r.unmatched_invoices, vec!["i2"]);
+}
+
+#[test]
+fn group_sums_beyond_i64_do_not_overflow() {
+    let half = 1_i64 << 62;
+    let config = MatchConfig {
+        amount_tolerance_minor: 1,
+        ..MatchConfig::default()
+    };
+    let r = run(
+        &[inv("i1", "INV-1", half), inv("i2", "INV-2", half)],
+        &[pay("p1", i64::MAX, "INV-1 INV-2")],
+        &config,
+    );
+    assert_eq!(r.matches.len(), 1);
+    assert_eq!(r.matches[0].kind, MatchKind::OneToMany);
+    assert_eq!(r.matches[0].residual_minor, -1);
+}

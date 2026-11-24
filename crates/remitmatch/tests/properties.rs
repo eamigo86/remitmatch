@@ -156,20 +156,40 @@ fn check(
     let mut seen_invoices = BTreeSet::new();
     let mut seen_payments = BTreeSet::new();
     for m in &result.matches {
-        prop_assert_eq!(m.kind, MatchKind::OneToOne);
-        prop_assert_eq!(m.payment_ids.len(), 1);
-        prop_assert_eq!(m.invoice_ids.len(), 1);
-        let (pid, iid) = (m.payment_ids[0].as_str(), m.invoice_ids[0].as_str());
-        prop_assert!(seen_payments.insert(pid), "payment {pid} matched twice");
-        prop_assert!(seen_invoices.insert(iid), "invoice {iid} matched twice");
-        let (p, i) = (payment_by_id[pid], invoice_by_id[iid]);
-        prop_assert_eq!(&p.scope, &i.scope);
-        prop_assert!(p.currency.eq_ignore_ascii_case(&i.currency));
-        prop_assert!(p.amount_minor > 0 && i.amount_minor > 0);
-        prop_assert!(
-            p.amount_minor.abs_diff(i.amount_minor) <= config.amount_tolerance_minor as u64
-        );
-        prop_assert_eq!(m.residual_minor, p.amount_minor - i.amount_minor);
+        let expected_kind = match (m.payment_ids.len(), m.invoice_ids.len()) {
+            (1, 1) => MatchKind::OneToOne,
+            (1, _) => MatchKind::OneToMany,
+            (_, 1) => MatchKind::ManyToOne,
+            sizes => return Err(TestCaseError::fail(format!("bad group shape {sizes:?}"))),
+        };
+        prop_assert_eq!(m.kind, expected_kind);
+        let mut payment_sum = 0_i128;
+        let mut invoice_sum = 0_i128;
+        for pid in &m.payment_ids {
+            prop_assert!(
+                seen_payments.insert(pid.as_str()),
+                "payment {pid} matched twice"
+            );
+            let p = payment_by_id[pid.as_str()];
+            prop_assert!(p.amount_minor > 0);
+            payment_sum += i128::from(p.amount_minor);
+            for iid in &m.invoice_ids {
+                let i = invoice_by_id[iid.as_str()];
+                prop_assert_eq!(&p.scope, &i.scope);
+                prop_assert!(p.currency.eq_ignore_ascii_case(&i.currency));
+            }
+        }
+        for iid in &m.invoice_ids {
+            prop_assert!(
+                seen_invoices.insert(iid.as_str()),
+                "invoice {iid} matched twice"
+            );
+            let i = invoice_by_id[iid.as_str()];
+            prop_assert!(i.amount_minor > 0);
+            invoice_sum += i128::from(i.amount_minor);
+        }
+        prop_assert!(payment_sum.abs_diff(invoice_sum) <= config.amount_tolerance_minor as u128);
+        prop_assert_eq!(i128::from(m.residual_minor), payment_sum - invoice_sum);
         let keys: Vec<&str> = m.breakdown.keys().map(String::as_str).collect();
         prop_assert_eq!(keys, vec!["amount", "date", "name", "reference"]);
         prop_assert!((0.0..=1.0).contains(&m.score));
