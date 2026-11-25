@@ -189,12 +189,6 @@ def test_wrong_element_and_config_types_raise_type_error() -> None:
         reconcile([], [], {"amount_tolerance_minor": 1})  # type: ignore[arg-type]
 
 
-def test_to_arrow_is_not_available_yet() -> None:
-    """to_arrow is a placeholder until the Arrow slice lands."""
-    with pytest.raises(NotImplementedError):
-        ReconciliationResult([], [], []).to_arrow()
-
-
 def test_concurrent_calls_agree() -> None:
     """Many threads can reconcile at once and all get the single-threaded result."""
     invoices = [inv(f"i{n}", f"INV-{n}", 1_000 + n) for n in range(60)]

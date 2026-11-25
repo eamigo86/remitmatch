@@ -370,11 +370,19 @@ class ReconciliationResult:
     def to_arrow(self) -> pyarrow.Table:
         """Return matches as a flat Arrow table (one row per payment-invoice pair).
 
+        The rows follow the order of matches, then of payments, then of invoices. The columns
+        are match_index (uint32, the position of the match), kind and status (strings, the
+        values of the enums), payment_id and invoice_id (strings), score (float64),
+        residual_minor (int64, repeated on each row of the match) and the per-signal scores
+        reference_score, amount_score, name_score and date_score (float64). Unmatched ids are
+        not included. A result without matches gives an empty table with the same columns.
+        The pyarrow package is imported when this method is called.
+
         Returns:
-            A table with one row for each payment-invoice pair in every match.
+            A pyarrow Table with one row for each payment-invoice pair in every match.
 
         Raises:
-            NotImplementedError: Always, because Arrow output is planned for a later release.
+            ImportError: pyarrow is not installed; install it with the arrow extra.
         """
 
     __hash__: None  # type: ignore[assignment]

@@ -11,6 +11,8 @@
 //! - `reconcile` copies its inputs, releases the GIL while the core runs and maps
 //!   [`remitmatch::Error`] to `ValueError`. Each input is a sequence of the expected classes
 //!   or an Arrow table (see the `arrow` module); anything else raises `TypeError`.
+//! - `ReconciliationResult.to_arrow` returns a `pyarrow.Table`; pyarrow is imported only when
+//!   it is called, so it stays an optional dependency.
 //! - Docstrings on the Python-facing items follow the Python documentation rules of the
 //!   project (Google style, no backticks), because they become `__doc__`.
 
@@ -19,10 +21,11 @@ mod arrow;
 use std::collections::BTreeMap;
 
 use chrono::NaiveDate;
-use pyo3::exceptions::{PyNotImplementedError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyImportError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyTuple, PyType};
+use pyo3_arrow::PyTable;
 use remitmatch::{
     Invoice, Match, MatchConfig, MatchKind, MatchStatus, Payment, ReconciliationResult,
 };
@@ -56,7 +59,7 @@ fn enum_value(
 }
 
 /// Returns the Python enum value of a match kind.
-fn kind_value(kind: MatchKind) -> &'static str {
+pub(crate) fn kind_value(kind: MatchKind) -> &'static str {
     match kind {
         MatchKind::OneToOne => "1:1",
         MatchKind::OneToMany => "1:N",
@@ -77,7 +80,7 @@ fn kind_from_value(value: &str) -> PyResult<MatchKind> {
 }
 
 /// Returns the Python enum value of a match status.
-fn status_value(status: MatchStatus) -> &'static str {
+pub(crate) fn status_value(status: MatchStatus) -> &'static str {
     match status {
         MatchStatus::Auto => "auto",
         MatchStatus::Suggested => "suggested",
@@ -667,15 +670,30 @@ impl PyReconciliationResult {
 
     /// Return matches as a flat Arrow table (one row per payment-invoice pair).
     ///
+    /// The rows follow the order of matches, then of payments, then of invoices. The columns
+    /// are match_index (uint32, the position of the match), kind and status (strings, the
+    /// values of the enums), payment_id and invoice_id (strings), score (float64),
+    /// residual_minor (int64, repeated on each row of the match) and the per-signal scores
+    /// reference_score, amount_score, name_score and date_score (float64). Unmatched ids are
+    /// not included. A result without matches gives an empty table with the same columns.
+    /// The pyarrow package is imported when this method is called.
+    ///
     /// Returns:
-    ///     A table with one row for each payment-invoice pair in every match.
+    ///     A pyarrow Table with one row for each payment-invoice pair in every match.
     ///
     /// Raises:
-    ///     NotImplementedError: Always, because Arrow output is planned for a later release.
-    fn to_arrow(&self) -> PyResult<()> {
-        Err(PyNotImplementedError::new_err(
-            "Arrow output is planned for a later release",
-        ))
+    ///     ImportError: pyarrow is not installed; install it with the arrow extra.
+    fn to_arrow<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        py.import("pyarrow").map_err(|cause| {
+            let error = PyImportError::new_err(
+                "to_arrow needs pyarrow; install it with: pip install \"remitmatch[arrow]\"",
+            );
+            error.set_cause(py, Some(cause));
+            error
+        })?;
+        let batch = py.detach(|| arrow::matches_batch(&self.0))?;
+        let schema = batch.schema();
+        PyTable::try_new(vec![batch], schema)?.into_pyarrow(py)
     }
 
     fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
