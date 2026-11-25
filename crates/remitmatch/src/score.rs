@@ -78,6 +78,47 @@ pub(crate) fn date_signal(value_date: NaiveDate, due_date: NaiveDate, window_day
     }
 }
 
+/// Finds the best approximate occurrence of `number` inside `reference`, without the
+/// prefilter; the reference the filtered search is tested against.
+#[cfg(test)]
+pub(crate) fn fuzzy_reference_signal(number: &str, reference: &str) -> f64 {
+    fuzzy_reference_signal_with(number, reference, None)
+}
+
+/// Character counts of a text, sorted by character, for the fuzzy reference prefilter.
+pub(crate) struct CharCounts(Vec<(char, u32)>);
+
+impl CharCounts {
+    /// Counts the characters of `text`.
+    pub(crate) fn of(text: &str) -> Self {
+        let mut chars: Vec<char> = text.chars().collect();
+        chars.sort_unstable();
+        let mut counts: Vec<(char, u32)> = Vec::new();
+        for c in chars {
+            match counts.last_mut() {
+                Some((last, n)) if *last == c => *n += 1,
+                _ => counts.push((c, 1)),
+            }
+        }
+        Self(counts)
+    }
+
+    /// Returns how many characters of `self` have no counterpart in `other` (multiset
+    /// difference): a lower bound of the edit distance from `self` to any part of `other`.
+    pub(crate) fn missing_from(&self, other: &Self) -> usize {
+        let mut theirs = other.0.iter().peekable();
+        let mut missing = 0;
+        for &(c, n) in &self.0 {
+            while theirs.next_if(|&&(o, _)| o < c).is_some() {}
+            let available = theirs
+                .peek()
+                .map_or(0, |&&(o, m)| if o == c { m } else { 0 });
+            missing += n.saturating_sub(available) as usize;
+        }
+        missing
+    }
+}
+
 /// Finds the best approximate occurrence of `number` inside `reference`.
 ///
 /// Both arguments are normalized. Returns 0 when `number` occurs exactly: the caller only
@@ -88,9 +129,24 @@ pub(crate) fn date_signal(value_date: NaiveDate, due_date: NaiveDate, window_day
 // allocation per window (about 66 microseconds per pair in a release build; 400 x 400
 // same-amount rows took 10.6 s). Upgrade: one approximate-substring DP (Sellers) per pair,
 // and do not materialize candidates below the suggest threshold.
-pub(crate) fn fuzzy_reference_signal(number: &str, reference: &str) -> f64 {
+///
+/// With `counts`, a prefilter on character counts runs first.
+/// `counts` holds the counts of `number` and of `reference`. A similarity of at least the
+/// floor allows at most `(len + 1) / 5` edits for a number of `len` characters (the windows
+/// are at most `len + 1` long), and every edit repairs at most one character missing from the
+/// reference, so a number with more missing characters scores 0 without the window search.
+pub(crate) fn fuzzy_reference_signal_with(
+    number: &str,
+    reference: &str,
+    counts: Option<(&CharCounts, &CharCounts)>,
+) -> f64 {
     let n = number.chars().count();
     if n < FUZZY_MIN_LEN || reference.contains(number) {
+        return 0.0;
+    }
+    if let Some((number_counts, reference_counts)) = counts
+        && number_counts.missing_from(reference_counts) > (n + 1) / 5
+    {
         return 0.0;
     }
     let chars: Vec<char> = reference.chars().collect();
@@ -255,5 +311,63 @@ mod tests {
         assert!(meets(0.90 - 1e-12, 0.90));
         assert!(meets(0.90, 0.90));
         assert!(!meets(0.89, 0.90));
+    }
+
+    /// Scores with the prefilter on the character counts of both strings.
+    fn counted(number: &str, reference: &str) -> f64 {
+        fuzzy_reference_signal_with(
+            number,
+            reference,
+            Some((&CharCounts::of(number), &CharCounts::of(reference))),
+        )
+    }
+
+    #[test]
+    fn counts_report_the_characters_missing_from_a_text() {
+        let missing = |a: &str, b: &str| CharCounts::of(a).missing_from(&CharCounts::of(b));
+        assert_eq!(missing("INV001", "PAGO INV001"), 0);
+        assert_eq!(missing("INV001", "INV01"), 1);
+        assert_eq!(missing("AAB", "A"), 2);
+        assert_eq!(missing("", "ABC"), 0);
+        assert_eq!(missing("ABC", ""), 3);
+        assert_eq!(missing("ÁÉ", "É"), 1);
+    }
+
+    #[test]
+    fn the_prefilter_keeps_pairs_at_the_edit_limit() {
+        // Ten characters allow two edits (similarity 0.8).
+        let number = "INV2024001";
+        for reference in [
+            "PAGO INV2024010 GRACIAS", // transposition
+            "PAGO INV202X001",         // one substitution
+            "PAGO INV2024XX1",         // two substitutions: exactly 0.8
+            "PAGO INV20X24001",        // insertion
+            "PAGO INV202401",          // deletion
+        ] {
+            let full = fuzzy_reference_signal(number, reference);
+            assert!(full >= FUZZY_FLOOR, "{reference}: {full}");
+            assert_eq!(counted(number, reference), full, "{reference}");
+        }
+    }
+
+    #[test]
+    fn the_prefilter_rejects_pairs_beyond_the_edit_limit() {
+        // Three substitutions are 0.7: the full search scores 0 and so does the filter.
+        let (number, reference) = ("INV2024001", "PAGO INV2XXX001");
+        assert!(close(fuzzy_reference_signal(number, reference), 0.0));
+        let missing = CharCounts::of(number).missing_from(&CharCounts::of(reference));
+        assert!(missing > (number.chars().count() + 1) / 5);
+        assert!(close(counted(number, reference), 0.0));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn the_prefilter_never_changes_the_signal(
+            number in "[ABC1]{4,10}",
+            reference in "[ABC1 ]{0,24}",
+        ) {
+            let plain = fuzzy_reference_signal_with(&number, &reference, None);
+            proptest::prop_assert_eq!(counted(&number, &reference), plain);
+        }
     }
 }
