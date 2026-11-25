@@ -21,8 +21,8 @@ from remitmatch._core import (
 )
 from remitmatch._enums import MatchKind, MatchStatus
 
-# The installed metadata carries the canonical Python form (0.1.0a1); the native core reports
-# the crate form (0.1.0-alpha.1) through version().
+# The installed metadata carries the canonical Python form (such as 0.1.0a2); the native core
+# reports the crate form (such as 0.1.0-alpha.2) through version().
 __version__ = metadata.version("remitmatch")
 __all__ = [
     "Invoice",

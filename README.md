@@ -5,7 +5,7 @@ including split and grouped payments (1:1, 1:N and N:1), and explains every matc
 per-signal score. Remittance matching is the accounts-receivable term for linking an
 incoming payment to the invoices it settles.
 
-**Status:** alpha. `0.1.0a1` is the first usable pre-release. The API may still change before
+**Status:** alpha. `0.1.0a2` is the current pre-release. The API may still change before
 `0.1.0`, and accuracy has only been measured on synthetic data, so read
 [Before you rely on it](#before-you-rely-on-it) first.
 
@@ -243,7 +243,7 @@ C stream and each value is copied once into the core structs. The core itself is
 The matching engine is a plain Rust crate with the same `reconcile` entry point:
 
 ```bash
-cargo add remitmatch@0.1.0-alpha.1
+cargo add remitmatch@0.1.0-alpha.2
 ```
 
 ## Build from source
