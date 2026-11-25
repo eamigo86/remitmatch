@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aho_corasick::{AhoCorasick, MatchKind as AcMatchKind};
 use chrono::NaiveDate;
@@ -96,59 +97,46 @@ struct Engine<'a> {
     skip_unnamed: bool,
 }
 
-/// Which rows of one partition are already matched, plus the matches found so far.
+/// Which rows are already matched in one partition, plus the matches found so far.
 ///
-/// A partition owns its rows, so its state is local: partitions can run on different
-/// threads and be merged afterwards.
+/// The flags are shared by all partitions and indexed by input row. A partition only reads
+/// and writes the flags of its own rows and partitions share no row, so relaxed atomics are
+/// enough and a check is a single load.
 struct Assigned<'a> {
-    /// Input indices of the partition's invoices, ascending.
-    invoice_rows: &'a [usize],
-    /// Input indices of the partition's payments, ascending.
-    payment_rows: &'a [usize],
-    invoice_flags: Vec<bool>,
-    payment_flags: Vec<bool>,
+    invoice_flags: &'a [AtomicBool],
+    payment_flags: &'a [AtomicBool],
     /// Each match with the smallest input index of its payments, used for ordering.
     found: Vec<(usize, Match)>,
 }
 
 impl<'a> Assigned<'a> {
-    /// Starts a partition with every row free.
-    fn new(invoice_rows: &'a [usize], payment_rows: &'a [usize]) -> Self {
+    /// Starts a partition with the shared flags of every row.
+    fn new(invoice_flags: &'a [AtomicBool], payment_flags: &'a [AtomicBool]) -> Self {
         Self {
-            invoice_rows,
-            payment_rows,
-            invoice_flags: vec![false; invoice_rows.len()],
-            payment_flags: vec![false; payment_rows.len()],
+            invoice_flags,
+            payment_flags,
             found: Vec::new(),
         }
     }
 
-    /// Returns the position of `row` in the sorted `rows` of the partition.
-    fn slot(rows: &[usize], row: usize) -> usize {
-        rows.binary_search(&row)
-            .expect("a row looked up in a partition belongs to it")
-    }
-
     /// Returns whether the invoice with input index `row` is already matched.
     fn invoice_taken(&self, row: usize) -> bool {
-        self.invoice_flags[Self::slot(self.invoice_rows, row)]
+        self.invoice_flags[row].load(Ordering::Relaxed)
     }
 
     /// Returns whether the payment with input index `row` is already matched.
     fn payment_taken(&self, row: usize) -> bool {
-        self.payment_flags[Self::slot(self.payment_rows, row)]
+        self.payment_flags[row].load(Ordering::Relaxed)
     }
 
     /// Marks the invoice with input index `row` as matched.
     fn take_invoice(&mut self, row: usize) {
-        let slot = Self::slot(self.invoice_rows, row);
-        self.invoice_flags[slot] = true;
+        self.invoice_flags[row].store(true, Ordering::Relaxed);
     }
 
     /// Marks the payment with input index `row` as matched.
     fn take_payment(&mut self, row: usize) {
-        let slot = Self::slot(self.payment_rows, row);
-        self.payment_flags[slot] = true;
+        self.payment_flags[row].store(true, Ordering::Relaxed);
     }
 }
 
@@ -192,32 +180,35 @@ pub(crate) fn reconcile(
     };
     let partitions = engine.partitions();
     let partitions: Vec<&PartitionRows> = partitions.values().collect();
-    // Partitions share no rows. Each runs on its own local state; the outcomes are collected
-    // in partition order, so the result does not depend on how the threads are scheduled.
+    // Partitions share no rows. Each touches only the flags of its own rows and
+    // keeps its own matches; the outcomes are collected in partition order, so the result
+    // does not depend on how the threads are scheduled.
+    let invoice_taken: Vec<AtomicBool> = (0..invoices.len())
+        .map(|_| AtomicBool::new(false))
+        .collect();
+    let payment_taken: Vec<AtomicBool> = (0..payments.len())
+        .map(|_| AtomicBool::new(false))
+        .collect();
     let owner = *POOL_OWNER.get_or_init(std::process::id);
-    let outcomes: Vec<Result<Assigned, Error>> = if runs_in_parallel(owner, std::process::id()) {
-        partitions
-            .par_iter()
-            .map(|(invoice_rows, payment_rows)| engine.run_partition(invoice_rows, payment_rows))
-            .collect()
-    } else {
-        partitions
-            .iter()
-            .map(|(invoice_rows, payment_rows)| engine.run_partition(invoice_rows, payment_rows))
-            .collect()
-    };
-    let mut invoice_taken = vec![false; invoices.len()];
-    let mut payment_taken = vec![false; payments.len()];
+    let outcomes: Vec<Result<Vec<(usize, Match)>, Error>> =
+        if runs_in_parallel(owner, std::process::id()) {
+            partitions
+                .par_iter()
+                .map(|(invoice_rows, payment_rows)| {
+                    engine.run_partition(&invoice_taken, &payment_taken, invoice_rows, payment_rows)
+                })
+                .collect()
+        } else {
+            partitions
+                .iter()
+                .map(|(invoice_rows, payment_rows)| {
+                    engine.run_partition(&invoice_taken, &payment_taken, invoice_rows, payment_rows)
+                })
+                .collect()
+        };
     let mut found = Vec::new();
     for outcome in outcomes {
-        let state = outcome?;
-        for (&row, &taken) in state.invoice_rows.iter().zip(&state.invoice_flags) {
-            invoice_taken[row] = taken;
-        }
-        for (&row, &taken) in state.payment_rows.iter().zip(&state.payment_flags) {
-            payment_taken[row] = taken;
-        }
-        found.extend(state.found);
+        found.extend(outcome?);
     }
     found.sort_by(|a, b| b.1.score.total_cmp(&a.1.score).then_with(|| a.0.cmp(&b.0)));
     Ok(ReconciliationResult {
@@ -260,9 +251,9 @@ fn runs_in_parallel(owner: u32, current: u32) -> bool {
 }
 
 /// Returns the ids whose rows were not taken, in input order.
-fn unmatched<'a>(ids: impl Iterator<Item = &'a String>, taken: &[bool]) -> Vec<String> {
+fn unmatched<'a>(ids: impl Iterator<Item = &'a String>, taken: &[AtomicBool]) -> Vec<String> {
     ids.zip(taken)
-        .filter(|&(_, &t)| !t)
+        .filter(|&(_, t)| !t.load(Ordering::Relaxed))
         .map(|(id, _)| id.clone())
         .collect()
 }
@@ -369,16 +360,18 @@ impl Engine<'_> {
 
     /// Runs the reference passes, the 1:1 candidate pass and the counterparty group passes
     /// on one partition.
-    fn run_partition<'a>(
+    fn run_partition(
         &self,
-        invoice_rows: &'a [usize],
-        payment_rows: &'a [usize],
-    ) -> Result<Assigned<'a>, Error> {
-        let mut state = Assigned::new(invoice_rows, payment_rows);
+        invoice_taken: &[AtomicBool],
+        payment_taken: &[AtomicBool],
+        invoice_rows: &[usize],
+        payment_rows: &[usize],
+    ) -> Result<Vec<(usize, Match)>, Error> {
+        let mut state = Assigned::new(invoice_taken, payment_taken);
         if !invoice_rows.is_empty() && !payment_rows.is_empty() {
             self.search_partition(invoice_rows, payment_rows, &mut state)?;
         }
-        Ok(state)
+        Ok(state.found)
     }
 
     /// Runs the passes on a partition that has rows on both sides.

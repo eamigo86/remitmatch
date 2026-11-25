@@ -13,7 +13,7 @@ use remitmatch::{MatchConfig, reconcile};
 #[path = "../tests/common/mod.rs"]
 mod common;
 
-use common::{Dataset, Noise, Shape, generate_shaped};
+use common::{Dataset, Noise, Shape, generate_dense, generate_shaped};
 
 /// The configuration used for the accuracy targets: a tolerance of 300 minor units.
 fn tolerant() -> MatchConfig {
@@ -140,15 +140,49 @@ fn many_scopes(c: &mut Criterion) {
 }
 
 /// Weights without a reference signal, so the counterparty group passes are active.
+///
+/// The single-scope case puts every row in one partition, where those passes dominate.
 fn no_reference_weights(c: &mut Criterion) {
+    let config = no_reference();
     bench_group(
         c,
         "no_reference_weights",
         &[1_000, 10_000],
         &Shape::default(),
-        &no_reference(),
+        &config,
         (10, 10),
     );
+    // A small tolerance and stricter thresholds leave many rows free for the group passes.
+    let strict = MatchConfig {
+        amount_tolerance_minor: 5,
+        suggest_threshold: 0.6,
+        auto_threshold: 0.9,
+        ..no_reference()
+    };
+    let mut group = c.benchmark_group("no_reference_weights_single_scope");
+    group
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(20));
+    for n in [5_000, 10_000] {
+        let mut set = generate_dense(1, n);
+        // One partition without references: few counterparty names and amounts, so the group
+        // pools are large and the pool filters dominate.
+        set.invoices.iter_mut().for_each(|i| {
+            i.scope = "one".to_owned();
+            i.currency = "EUR".to_owned();
+        });
+        set.payments.iter_mut().for_each(|p| {
+            p.scope = "one".to_owned();
+            p.currency = "EUR".to_owned();
+            p.reference.clear();
+        });
+        group.bench_with_input(BenchmarkId::from_parameter(n), &set, |b, set| {
+            b.iter(|| {
+                reconcile(black_box(&set.invoices), black_box(&set.payments), &strict).unwrap()
+            });
+        });
+    }
+    group.finish();
 }
 
 criterion_group!(
