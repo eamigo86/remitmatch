@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use aho_corasick::{AhoCorasick, MatchKind as AcMatchKind};
 use chrono::NaiveDate;
+use rayon::prelude::*;
 
 use crate::normalize::{Reference, normalize_name, normalize_reference};
 use crate::score::{
@@ -87,12 +88,60 @@ struct Engine<'a> {
     payment_name: Vec<String>,
 }
 
-/// Which rows are already matched, plus the matches found so far.
-struct Assigned {
-    invoice_taken: Vec<bool>,
-    payment_taken: Vec<bool>,
+/// Which rows of one partition are already matched, plus the matches found so far.
+///
+/// A partition owns its rows, so its state is local: partitions can run on different
+/// threads and be merged afterwards.
+struct Assigned<'a> {
+    /// Input indices of the partition's invoices, ascending.
+    invoice_rows: &'a [usize],
+    /// Input indices of the partition's payments, ascending.
+    payment_rows: &'a [usize],
+    invoice_flags: Vec<bool>,
+    payment_flags: Vec<bool>,
     /// Each match with the smallest input index of its payments, used for ordering.
     found: Vec<(usize, Match)>,
+}
+
+impl<'a> Assigned<'a> {
+    /// Starts a partition with every row free.
+    fn new(invoice_rows: &'a [usize], payment_rows: &'a [usize]) -> Self {
+        Self {
+            invoice_rows,
+            payment_rows,
+            invoice_flags: vec![false; invoice_rows.len()],
+            payment_flags: vec![false; payment_rows.len()],
+            found: Vec::new(),
+        }
+    }
+
+    /// Returns the position of `row` in the sorted `rows` of the partition.
+    fn slot(rows: &[usize], row: usize) -> usize {
+        rows.binary_search(&row)
+            .expect("a row looked up in a partition belongs to it")
+    }
+
+    /// Returns whether the invoice with input index `row` is already matched.
+    fn invoice_taken(&self, row: usize) -> bool {
+        self.invoice_flags[Self::slot(self.invoice_rows, row)]
+    }
+
+    /// Returns whether the payment with input index `row` is already matched.
+    fn payment_taken(&self, row: usize) -> bool {
+        self.payment_flags[Self::slot(self.payment_rows, row)]
+    }
+
+    /// Marks the invoice with input index `row` as matched.
+    fn take_invoice(&mut self, row: usize) {
+        let slot = Self::slot(self.invoice_rows, row);
+        self.invoice_flags[slot] = true;
+    }
+
+    /// Marks the payment with input index `row` as matched.
+    fn take_payment(&mut self, row: usize) {
+        let slot = Self::slot(self.payment_rows, row);
+        self.payment_flags[slot] = true;
+    }
 }
 
 /// Runs the 1:1 engine; see [`crate::reconcile`] for the contract.
@@ -125,21 +174,32 @@ pub(crate) fn reconcile(
             .map(|p| normalize_name(&p.counterparty))
             .collect(),
     };
-    let mut state = Assigned {
-        invoice_taken: vec![false; invoices.len()],
-        payment_taken: vec![false; payments.len()],
-        found: Vec::new(),
-    };
-    for (invoice_rows, payment_rows) in engine.partitions().values() {
-        engine.run_partition(invoice_rows, payment_rows, &mut state)?;
+    let partitions = engine.partitions();
+    let partitions: Vec<&PartitionRows> = partitions.values().collect();
+    // Partitions share no rows. Each runs on its own local state; the outcomes are collected
+    // in partition order, so the result does not depend on how the threads are scheduled.
+    let outcomes: Vec<Result<Assigned, Error>> = partitions
+        .par_iter()
+        .map(|(invoice_rows, payment_rows)| engine.run_partition(invoice_rows, payment_rows))
+        .collect();
+    let mut invoice_taken = vec![false; invoices.len()];
+    let mut payment_taken = vec![false; payments.len()];
+    let mut found = Vec::new();
+    for outcome in outcomes {
+        let state = outcome?;
+        for (&row, &taken) in state.invoice_rows.iter().zip(&state.invoice_flags) {
+            invoice_taken[row] = taken;
+        }
+        for (&row, &taken) in state.payment_rows.iter().zip(&state.payment_flags) {
+            payment_taken[row] = taken;
+        }
+        found.extend(state.found);
     }
-    state
-        .found
-        .sort_by(|a, b| b.1.score.total_cmp(&a.1.score).then_with(|| a.0.cmp(&b.0)));
+    found.sort_by(|a, b| b.1.score.total_cmp(&a.1.score).then_with(|| a.0.cmp(&b.0)));
     Ok(ReconciliationResult {
-        matches: state.found.into_iter().map(|(_, m)| m).collect(),
-        unmatched_payments: unmatched(payments.iter().map(|p| &p.id), &state.payment_taken),
-        unmatched_invoices: unmatched(invoices.iter().map(|i| &i.id), &state.invoice_taken),
+        matches: found.into_iter().map(|(_, m)| m).collect(),
+        unmatched_payments: unmatched(payments.iter().map(|p| &p.id), &payment_taken),
+        unmatched_invoices: unmatched(invoices.iter().map(|i| &i.id), &invoice_taken),
     })
 }
 
@@ -253,15 +313,25 @@ impl Engine<'_> {
 
     /// Runs the reference passes, the 1:1 candidate pass and the counterparty group passes
     /// on one partition.
-    fn run_partition(
+    fn run_partition<'a>(
+        &self,
+        invoice_rows: &'a [usize],
+        payment_rows: &'a [usize],
+    ) -> Result<Assigned<'a>, Error> {
+        let mut state = Assigned::new(invoice_rows, payment_rows);
+        if !invoice_rows.is_empty() && !payment_rows.is_empty() {
+            self.search_partition(invoice_rows, payment_rows, &mut state)?;
+        }
+        Ok(state)
+    }
+
+    /// Runs the passes on a partition that has rows on both sides.
+    fn search_partition(
         &self,
         invoice_rows: &[usize],
         payment_rows: &[usize],
-        state: &mut Assigned,
+        state: &mut Assigned<'_>,
     ) -> Result<(), Error> {
-        if invoice_rows.is_empty() || payment_rows.is_empty() {
-            return Ok(());
-        }
         let (candidates, mentions) = self.reference_pass(invoice_rows, payment_rows)?;
         self.assign(candidates, state);
         let candidates = self.named_payment_groups(payment_rows, &mentions, state);
@@ -269,13 +339,13 @@ impl Engine<'_> {
 
         let mut open: Vec<(i64, usize)> = invoice_rows
             .iter()
-            .filter(|&&i| !state.invoice_taken[i])
+            .filter(|&&i| !state.invoice_taken(i))
             .map(|&i| (self.invoices[i].amount_minor, i))
             .collect();
         open.sort_unstable();
         let candidates = payment_rows
             .iter()
-            .filter(|&&p| !state.payment_taken[p])
+            .filter(|&&p| !state.payment_taken(p))
             .flat_map(|&p| self.window_candidates(p, &open, mentions.contains_key(&p)))
             .collect();
         self.assign(candidates, state);
@@ -473,12 +543,12 @@ impl Engine<'_> {
         &self,
         payment_rows: &[usize],
         mentions: &Mentions,
-        state: &Assigned,
+        state: &Assigned<'_>,
     ) -> Vec<Candidate> {
         let mut naming: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for &p in payment_rows.iter().filter(|&&p| !state.payment_taken[p]) {
+        for &p in payment_rows.iter().filter(|&&p| !state.payment_taken(p)) {
             for &i in mentions.get(&p).into_iter().flatten() {
-                if !state.invoice_taken[i] {
+                if !state.invoice_taken(i) {
                     naming.entry(i).or_default().push(p);
                 }
             }
@@ -566,14 +636,14 @@ impl Engine<'_> {
         invoice_rows: &[usize],
         payment_rows: &[usize],
         mentions: &Mentions,
-        state: &mut Assigned,
+        state: &mut Assigned<'_>,
     ) {
-        let invoices = by_name(invoice_rows, &state.invoice_taken, &self.invoice_name);
+        let invoices = by_name(invoice_rows, |r| state.invoice_taken(r), &self.invoice_name);
         let payments = oldest(
             payment_rows
                 .iter()
                 .copied()
-                .filter(|&p| !state.payment_taken[p])
+                .filter(|&p| !state.payment_taken(p))
                 .collect(),
             |p| self.payments[p].value_date,
         );
@@ -590,7 +660,7 @@ impl Engine<'_> {
                 .flat_map(|rows| rows.iter().copied())
                 .filter(|&i| {
                     let inv = &self.invoices[i];
-                    !state.invoice_taken[i]
+                    !state.invoice_taken(i)
                         && i128::from(inv.amount_minor) <= limit
                         && self.within_window(pay.value_date, inv.due_date)
                 })
@@ -623,14 +693,14 @@ impl Engine<'_> {
         invoice_rows: &[usize],
         payment_rows: &[usize],
         mentions: &Mentions,
-        state: &mut Assigned,
+        state: &mut Assigned<'_>,
     ) {
-        let payments = by_name(payment_rows, &state.payment_taken, &self.payment_name);
+        let payments = by_name(payment_rows, |r| state.payment_taken(r), &self.payment_name);
         let invoices = oldest(
             invoice_rows
                 .iter()
                 .copied()
-                .filter(|&i| !state.invoice_taken[i])
+                .filter(|&i| !state.invoice_taken(i))
                 .collect(),
             |i| self.invoices[i].due_date,
         );
@@ -647,7 +717,7 @@ impl Engine<'_> {
                 .flat_map(|rows| rows.iter().copied())
                 .filter(|&p| {
                     let pay = &self.payments[p];
-                    !state.payment_taken[p]
+                    !state.payment_taken(p)
                         && i128::from(pay.amount_minor) <= limit
                         && self.within_window(pay.value_date, inv.due_date)
                 })
@@ -677,7 +747,7 @@ impl Engine<'_> {
     /// anchor had more than one fitting group in this pass, or when its group came from a
     /// pool cut to [`GROUP_CANDIDATE_LIMIT`] rows (the search was incomplete). A lone
     /// candidate is never ambiguous by the margin rule.
-    fn assign(&self, mut candidates: Vec<Candidate>, state: &mut Assigned) {
+    fn assign(&self, mut candidates: Vec<Candidate>, state: &mut Assigned<'_>) {
         let config = self.config;
         let mut top_two: HashMap<Anchor, (f64, f64)> = HashMap::new();
         let mut groups_per_anchor: HashMap<Anchor, usize> = HashMap::new();
@@ -716,16 +786,16 @@ impl Engine<'_> {
         });
         for c in candidates {
             let (pay_rows, inv_rows) = (c.payments.as_slice(), c.invoices.as_slice());
-            if pay_rows.iter().any(|&p| state.payment_taken[p])
-                || inv_rows.iter().any(|&i| state.invoice_taken[i])
+            if pay_rows.iter().any(|&p| state.payment_taken(p))
+                || inv_rows.iter().any(|&i| state.invoice_taken(i))
             {
                 continue;
             }
             for &p in pay_rows {
-                state.payment_taken[p] = true;
+                state.take_payment(p);
             }
             for &i in inv_rows {
-                state.invoice_taken[i] = true;
+                state.take_invoice(i);
             }
             let (first, second) = top_two[&c.anchor];
             let several_groups = c.is_group() && groups_per_anchor.get(&c.anchor) > Some(&1);
@@ -771,11 +841,11 @@ impl Engine<'_> {
 /// Buckets the free rows by normalized name, keeping input order inside each bucket.
 fn by_name<'a>(
     rows: &[usize],
-    taken: &[bool],
+    taken: impl Fn(usize) -> bool,
     names: &'a [String],
 ) -> BTreeMap<&'a str, Vec<usize>> {
     let mut buckets: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
-    for &row in rows.iter().filter(|&&r| !taken[r]) {
+    for &row in rows.iter().filter(|&&r| !taken(r)) {
         buckets.entry(names[row].as_str()).or_default().push(row);
     }
     buckets
@@ -808,4 +878,65 @@ fn similar_buckets<'a, 'b>(
 fn oldest(mut rows: Vec<usize>, date: impl Fn(usize) -> NaiveDate) -> Vec<usize> {
     rows.sort_by_key(|&r| (date(r), r));
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds `scopes` partitions of a few rows each: named, unnamed and grouped payments.
+    fn many_partitions(scopes: usize) -> (Vec<Invoice>, Vec<Payment>) {
+        let day = |d: u64| NaiveDate::from_ymd_opt(2024, 1, 1).unwrap() + chrono::Days::new(d);
+        let (mut invoices, mut payments) = (Vec::new(), Vec::new());
+        for s in 0..scopes {
+            for k in 0..6_i64 {
+                invoices.push(Invoice {
+                    id: format!("i{s}-{k}"),
+                    number: format!("INV-{s}-{k}"),
+                    amount_minor: 1_000 + 100 * (k % 3),
+                    currency: "EUR".to_owned(),
+                    issue_date: day(0),
+                    due_date: day(10 + k as u64),
+                    counterparty: "Acme S.L.".to_owned(),
+                    scope: format!("scope-{s}"),
+                });
+            }
+            for k in 0..5_i64 {
+                payments.push(Payment {
+                    id: format!("p{s}-{k}"),
+                    amount_minor: 1_000 + 100 * (k % 3) + if k == 4 { 1_000 } else { 0 },
+                    currency: "EUR".to_owned(),
+                    value_date: day(12),
+                    reference: if k % 2 == 0 {
+                        format!("pago INV-{s}-{k}")
+                    } else {
+                        "thanks".to_owned()
+                    },
+                    counterparty: "ACME".to_owned(),
+                    scope: format!("scope-{s}"),
+                });
+            }
+        }
+        (invoices, payments)
+    }
+
+    #[test]
+    fn the_result_does_not_depend_on_the_number_of_threads() {
+        let (invoices, payments) = many_partitions(60);
+        let config = MatchConfig {
+            suggest_threshold: 0.3,
+            ..MatchConfig::default()
+        };
+        let run = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| reconcile(&invoices, &payments, &config).unwrap())
+        };
+        let single = run(1);
+        assert!(single.matches.len() > 60, "the data must produce matches");
+        assert_eq!(single, run(8));
+        assert_eq!(single, run(32));
+    }
 }
