@@ -85,15 +85,60 @@ struct Engine<'a> {
     /// Amount tolerance as an unsigned value; validated to be non-negative.
     tolerance: u64,
     invoice_number: Vec<String>,
-    invoice_name: Vec<String>,
+    invoice_name: Names,
     payment_reference: Vec<Reference>,
-    payment_name: Vec<String>,
+    payment_name: Names,
     /// Character counts of each normalized invoice number, built when the fuzzy reference
     /// prefilter first needs them.
     invoice_number_counts: Vec<LazyCounts>,
     /// Whether a candidate with no reference signal can neither be accepted nor make another
     /// candidate of its anchor ambiguous; see [`cannot_matter`].
     skip_unnamed: bool,
+}
+
+/// Normalized counterparty names of one side, stored once per distinct text.
+struct Names {
+    /// For each input row, the position of its name in `distinct`.
+    ids: Vec<usize>,
+    /// The normalized name of each distinct raw text, ordered by the raw text.
+    distinct: Vec<String>,
+}
+
+impl Names {
+    /// Normalizes the distinct texts of `rows`; `text` reads the raw name of a row.
+    fn new<T: Sync>(rows: &[T], parallel: bool, text: impl Fn(&T) -> &str + Sync + Send) -> Self {
+        let mut raw: Vec<&str> = if parallel {
+            rows.par_iter()
+                .fold(HashSet::new, |mut seen, row| {
+                    seen.insert(text(row));
+                    seen
+                })
+                .reduce(HashSet::new, |mut all, seen| {
+                    all.extend(seen);
+                    all
+                })
+                .into_iter()
+                .collect()
+        } else {
+            rows.iter()
+                .map(&text)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        // Sorted, so the layout does not depend on how the threads were scheduled.
+        raw.sort_unstable();
+        let position: HashMap<&str, usize> = raw.iter().enumerate().map(|(k, &t)| (t, k)).collect();
+        Self {
+            ids: map_rows(rows, parallel, |row| position[text(row)]),
+            distinct: map_rows(&raw, parallel, |&t| normalize_name(t)),
+        }
+    }
+
+    /// Returns the normalized name of the row with input index `row`.
+    fn get(&self, row: usize) -> &str {
+        &self.distinct[self.ids[row]]
+    }
 }
 
 /// Which rows are already matched in one partition, plus the matches found so far.
@@ -187,9 +232,9 @@ fn reconcile_validated(
         tolerance: u64::try_from(config.amount_tolerance_minor).unwrap_or(0),
         invoice_number_counts: (0..invoices.len()).map(|_| LazyCounts::default()).collect(),
         invoice_number,
-        invoice_name: map_rows(invoices, parallel, |i| normalize_name(&i.counterparty)),
+        invoice_name: Names::new(invoices, parallel, |i| i.counterparty.as_str()),
         payment_reference,
-        payment_name: map_rows(payments, parallel, |p| normalize_name(&p.counterparty)),
+        payment_name: Names::new(payments, parallel, |p| p.counterparty.as_str()),
         skip_unnamed: cannot_matter(&Weights::from_map(&config.weights), config, 0.0),
     };
     let partitions = engine.partitions();
@@ -458,7 +503,10 @@ impl Engine<'_> {
         let (mut name, mut date) = (1.0_f64, 0.0_f64);
         for &p in pay_rows {
             for &i in inv_rows {
-                name = name.min(name_signal(&self.payment_name[p], &self.invoice_name[i]));
+                name = name.min(name_signal(
+                    self.payment_name.get(p),
+                    self.invoice_name.get(i),
+                ));
                 date += date_signal(
                     self.payments[p].value_date,
                     self.invoices[i].due_date,
@@ -728,7 +776,7 @@ impl Engine<'_> {
             let pay = &self.payments[p];
             let limit = i128::from(pay.amount_minor) + i128::from(self.tolerance);
             let pool = similar
-                .get(self.payment_name[p].as_str())
+                .get(self.payment_name.get(p))
                 .iter()
                 .flat_map(|rows| rows.iter().copied())
                 .filter(|&i| {
@@ -788,7 +836,7 @@ impl Engine<'_> {
             let inv = &self.invoices[i];
             let limit = i128::from(inv.amount_minor) + i128::from(self.tolerance);
             let pool = similar
-                .get(self.invoice_name[i].as_str())
+                .get(self.invoice_name.get(i))
                 .iter()
                 .flat_map(|rows| rows.iter().copied())
                 .filter(|&p| {
@@ -918,11 +966,11 @@ impl Engine<'_> {
 fn by_name<'a>(
     rows: &[usize],
     taken: impl Fn(usize) -> bool,
-    names: &'a [String],
+    names: &'a Names,
 ) -> BTreeMap<&'a str, Vec<usize>> {
     let mut buckets: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for &row in rows.iter().filter(|&&r| !taken(r)) {
-        buckets.entry(names[row].as_str()).or_default().push(row);
+        buckets.entry(names.get(row)).or_default().push(row);
     }
     buckets
 }
@@ -1037,6 +1085,22 @@ mod tests {
         let sequential = reconcile_validated(&invoices, &payments, &config, false).unwrap();
         assert!(parallel.matches.len() > 30, "the data must produce matches");
         assert_eq!(parallel, sequential);
+    }
+
+    #[test]
+    fn names_are_normalized_once_per_distinct_text_in_both_modes() {
+        let raw = ["Acme S.L.", "ACME", "Acme S.L.", "Beta Inc.", "ACME", ""];
+        let build = |parallel: bool| Names::new(&raw, parallel, |text| text);
+        for parallel in [false, true] {
+            let names = build(parallel);
+            assert_eq!(names.distinct.len(), 4, "one entry per distinct raw text");
+            for (row, text) in raw.iter().enumerate() {
+                assert_eq!(names.get(row), normalize_name(text), "row {row}");
+            }
+        }
+        let (sequential, parallel) = (build(false), build(true));
+        assert_eq!(sequential.ids, parallel.ids);
+        assert_eq!(sequential.distinct, parallel.distinct);
     }
 
     #[test]
