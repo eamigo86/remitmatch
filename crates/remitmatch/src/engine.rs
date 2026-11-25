@@ -2,6 +2,7 @@
 //! pass, group search and greedy assignment.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::OnceLock;
 
 use aho_corasick::{AhoCorasick, MatchKind as AcMatchKind};
 use chrono::NaiveDate;
@@ -193,10 +194,18 @@ pub(crate) fn reconcile(
     let partitions: Vec<&PartitionRows> = partitions.values().collect();
     // Partitions share no rows. Each runs on its own local state; the outcomes are collected
     // in partition order, so the result does not depend on how the threads are scheduled.
-    let outcomes: Vec<Result<Assigned, Error>> = partitions
-        .par_iter()
-        .map(|(invoice_rows, payment_rows)| engine.run_partition(invoice_rows, payment_rows))
-        .collect();
+    let owner = *POOL_OWNER.get_or_init(std::process::id);
+    let outcomes: Vec<Result<Assigned, Error>> = if runs_in_parallel(owner, std::process::id()) {
+        partitions
+            .par_iter()
+            .map(|(invoice_rows, payment_rows)| engine.run_partition(invoice_rows, payment_rows))
+            .collect()
+    } else {
+        partitions
+            .iter()
+            .map(|(invoice_rows, payment_rows)| engine.run_partition(invoice_rows, payment_rows))
+            .collect()
+    };
     let mut invoice_taken = vec![false; invoices.len()];
     let mut payment_taken = vec![false; payments.len()];
     let mut found = Vec::new();
@@ -235,6 +244,19 @@ fn cannot_matter(weights: &Weights, config: &MatchConfig, reference: f64) -> boo
     let bound = weighted_score(&best, weights);
     bound <= config.suggest_threshold - config.ambiguity_margin
         && !meets(bound, config.suggest_threshold)
+}
+
+/// The process that first ran partitions in parallel, which is the one that owns the pool.
+static POOL_OWNER: OnceLock<u32> = OnceLock::new();
+
+/// Returns whether the process `current` may use the thread pool that `owner` started.
+///
+/// A process forked after its parent used rayon inherits the pool's bookkeeping but none of
+/// its worker threads, so waiting for them would never return.
+// ponytail: a child forked after the parent's first call runs its partitions sequentially.
+// Upgrade: a per-process pool rebuilt after the fork (for example with a pthread_atfork hook).
+fn runs_in_parallel(owner: u32, current: u32) -> bool {
+    owner == current
 }
 
 /// Returns the ids whose rows were not taken, in input order.
@@ -979,6 +1001,12 @@ mod tests {
             }
         }
         (invoices, payments)
+    }
+
+    #[test]
+    fn partitions_run_in_parallel_only_in_the_process_that_started_the_pool() {
+        assert!(runs_in_parallel(7, 7));
+        assert!(!runs_in_parallel(7, 8), "a forked child has no workers");
     }
 
     #[test]
