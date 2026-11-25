@@ -515,3 +515,224 @@ pub fn generate(seed: u64, n_invoices: usize, noise: &Noise) -> Dataset {
         solution,
     }
 }
+
+/// Counterparty names of the dense generator; three pairs differ only by a legal suffix.
+const DENSE_NAMES: [&str; 8] = [
+    "Acme Trading",
+    "Acme Trading Ltd",
+    "Borealis Foods",
+    "Borealis Foods S.L.",
+    "Cobalt Works",
+    "Delta Freight GmbH",
+    "Delta Freight",
+    "Evergreen Supply",
+];
+
+/// The few distinct amounts of the dense generator, in minor units.
+const DENSE_AMOUNTS: [i64; 12] = [
+    5_000, 7_500, 10_000, 12_500, 15_000, 20_000, 25_000, 25_050, 40_000, 50_000, 75_000, 100_000,
+];
+
+/// Returns the index of the name that differs from `name` only by a legal suffix, if any.
+fn dense_twin(name: usize) -> usize {
+    match name {
+        0 => 1,
+        1 => 0,
+        2 => 3,
+        3 => 2,
+        5 => 6,
+        6 => 5,
+        other => other,
+    }
+}
+
+/// Returns the invoice number of pool entry `k`; every eighth number is a bare digit run.
+fn dense_number(k: usize) -> String {
+    if k.is_multiple_of(8) {
+        format!("{k:04}")
+    } else {
+        format!("INV-{k:04}")
+    }
+}
+
+/// Writes a payment reference naming the given pool numbers in one of three styles.
+///
+/// Up to three numbers are named; sometimes none, sometimes an extra one that the payment
+/// does not settle.
+fn dense_reference(rng: &mut Rng, settled: &[usize], pool: usize) -> String {
+    if rng.chance(0.1) {
+        return String::new();
+    }
+    let mut named: Vec<usize> = if rng.chance(0.25) {
+        Vec::new()
+    } else {
+        settled.iter().take(3).copied().collect()
+    };
+    if named.len() < 3 && rng.chance(0.15) {
+        named.push(1 + rng.below(pool));
+    }
+    if named.is_empty() {
+        return format!("TRANSFER {:06}", rng.below(1_000_000));
+    }
+    let style = rng.below(3);
+    let parts: Vec<String> = named
+        .iter()
+        .map(|&k| {
+            let mut text = match style {
+                0 => dense_number(k),
+                1 => dense_number(k).to_lowercase().replace('-', " "),
+                _ => dense_number(k).replace('-', ""),
+            };
+            if rng.chance(0.1) {
+                // One edit: an inserted digit, a dropped character or a changed digit.
+                let at = text.len() - 1 - rng.below(3);
+                match rng.below(3) {
+                    0 => text.insert(at, '7'),
+                    1 => {
+                        text.remove(at);
+                    }
+                    _ => text.replace_range(at..=at, "3"),
+                }
+            }
+            text
+        })
+        .collect();
+    format!("Payment {}", parts.join(" "))
+}
+
+/// Generates a reproducible dataset built for collisions; the same seed gives the same data.
+///
+/// Few distinct amounts, eight counterparty names (three pairs differ only by a legal
+/// suffix), a small pool of shared invoice numbers, due dates inside about 60 days, two
+/// scopes, two currencies (sometimes in lower case) and some non-positive amounts. Payments
+/// are single, partial (two payments for one invoice) or grouped (one payment for two or
+/// three invoices of one partition), and references name zero to three numbers. The
+/// dataset has no known solution, so `solution` is empty.
+pub fn generate_dense(seed: u64, n_invoices: usize) -> Dataset {
+    let mut rng = Rng(seed);
+    let base = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+    let pool = (n_invoices / 8).clamp(8, 400);
+
+    let mut invoices: Vec<Invoice> = Vec::new();
+    let mut names: Vec<usize> = Vec::new();
+    for n in 0..n_invoices {
+        let name = rng.below(DENSE_NAMES.len());
+        let mut amount = *rng.pick(&DENSE_AMOUNTS);
+        match rng.below(40) {
+            0 => amount = 0,
+            1 => amount = -amount,
+            _ if rng.chance(0.1) => amount += rng.range(1, 250),
+            _ => {}
+        }
+        let due = shift(base, rng.range(0, 60));
+        let currency = *rng.pick(&CURRENCIES);
+        invoices.push(Invoice {
+            id: format!("I-{n:05}"),
+            number: dense_number(1 + rng.below(pool)),
+            amount_minor: amount,
+            currency: if rng.chance(0.1) {
+                currency.to_lowercase()
+            } else {
+                currency.to_owned()
+            },
+            issue_date: shift(due, -30),
+            due_date: due,
+            counterparty: DENSE_NAMES[name].to_owned(),
+            scope: (*rng.pick(&SCOPES)).to_owned(),
+        });
+        names.push(name);
+    }
+
+    let key = |i: &Invoice| (i.scope.clone(), i.currency.to_uppercase());
+    let mut payments: Vec<Payment> = Vec::new();
+    let mut push = |rng: &mut Rng, anchor: usize, amount: i64, numbers: &[usize], pool| {
+        let inv = &invoices[anchor];
+        let name = if rng.chance(0.8) {
+            names[anchor]
+        } else if rng.chance(0.5) {
+            dense_twin(names[anchor])
+        } else {
+            rng.below(DENSE_NAMES.len())
+        };
+        let date = shift(inv.due_date, rng.range(-8, 12)).clamp(base, shift(base, 62));
+        payments.push(Payment {
+            id: format!("P-{:05}", payments.len()),
+            amount_minor: amount,
+            currency: inv.currency.clone(),
+            value_date: date,
+            reference: dense_reference(rng, numbers, pool),
+            counterparty: DENSE_NAMES[name].to_owned(),
+            scope: inv.scope.clone(),
+        });
+    };
+    let number_of = |i: &Invoice| {
+        i.number
+            .trim_start_matches("INV-")
+            .parse::<usize>()
+            .unwrap_or_default()
+    };
+    for n in 0..n_invoices {
+        let inv = &invoices[n];
+        if inv.amount_minor <= 0 {
+            continue;
+        }
+        let roll = rng.below(100);
+        if roll < 5 {
+            continue;
+        } else if roll < 20 && inv.amount_minor >= 2 {
+            let first = rng.range(1, inv.amount_minor - 1);
+            push(&mut rng, n, first, &[number_of(inv)], pool);
+            push(
+                &mut rng,
+                n,
+                inv.amount_minor - first,
+                &[number_of(inv)],
+                pool,
+            );
+        } else if roll < 35 {
+            let mut members = vec![n];
+            for _ in 0..rng.below(3).max(1) {
+                let j = rng.below(n_invoices);
+                if key(&invoices[j]) == key(inv)
+                    && invoices[j].amount_minor > 0
+                    && !members.contains(&j)
+                {
+                    members.push(j);
+                }
+            }
+            let total: i64 = members.iter().map(|&j| invoices[j].amount_minor).sum();
+            let numbers: Vec<usize> = members.iter().map(|&j| number_of(&invoices[j])).collect();
+            push(&mut rng, n, total, &numbers, pool);
+        } else {
+            let fee = if rng.chance(0.1) {
+                rng.range(1, 250)
+            } else {
+                0
+            };
+            push(
+                &mut rng,
+                n,
+                (inv.amount_minor - fee).max(1),
+                &[number_of(inv)],
+                pool,
+            );
+        }
+    }
+    for _ in 0..n_invoices / 30 {
+        let anchor = rng.below(n_invoices);
+        let amount = if rng.chance(0.5) {
+            0
+        } else {
+            -*rng.pick(&DENSE_AMOUNTS)
+        };
+        push(&mut rng, anchor, amount, &[], pool);
+    }
+    for i in (1..payments.len()).rev() {
+        payments.swap(i, rng.below(i + 1));
+    }
+    Dataset {
+        invoices,
+        payments,
+        solution: Vec::new(),
+    }
+}
