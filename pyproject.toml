@@ -13,7 +13,7 @@ license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
 authors = [{ name = "Ernesto Pérez Amigo" }]
 keywords = ["reconciliation", "invoices", "payments", "fintech", "pyo3"]
 classifiers = [
-    "Development Status :: 1 - Planning",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Rust",
@@ -64,6 +64,7 @@ dev = [
     "hypothesis>=6.168.5",
     "maturin>=1.16.0",
     "mypy>=2.4.1",
+    "packaging>=26.4",
     "polars>=2.0.0",
     "pyarrow>=25.0.1",
     "pytest>=9.2.0",
