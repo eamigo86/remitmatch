@@ -124,7 +124,7 @@ const SUFFIXES: [&str; 6] = ["S.L.", "S.A.", "LLC", "Inc.", "GmbH", "Ltd"];
 struct Customer {
     name: String,
     bank_name: String,
-    scope: &'static str,
+    scope: String,
     currency: &'static str,
     fixed_amount: Option<i64>,
 }
@@ -167,7 +167,7 @@ fn customer(rng: &mut Rng) -> Customer {
     Customer {
         name,
         bank_name: bank.join(" "),
-        scope: rng.pick(&SCOPES),
+        scope: (*rng.pick(&SCOPES)).to_owned(),
         currency: rng.pick(&CURRENCIES),
         fixed_amount: rng.chance(0.2).then(|| rng.range(1_000, 5_000_000)),
     }
@@ -418,15 +418,45 @@ fn close_batch(
     }
 }
 
+/// Layout overrides for [`generate_shaped`]; the default keeps the generator's own layout.
+#[derive(Default)]
+pub struct Shape {
+    /// Spread the customers over this many scopes instead of the two default ones.
+    pub scopes: Option<usize>,
+    /// Put every row in one currency, so that a single scope is a single partition.
+    pub single_currency: bool,
+    /// Give every customer a fixed invoice amount drawn from this many distinct amounts.
+    pub distinct_amounts: Option<usize>,
+}
+
 /// Generates a reproducible dataset with the given noise; the same seed gives the same data.
 ///
 /// Per invoice, in order: unpaid, else paid in parts, else joined to a batch, else paid by
 /// one payment.
 pub fn generate(seed: u64, n_invoices: usize, noise: &Noise) -> Dataset {
+    generate_shaped(seed, n_invoices, noise, &Shape::default())
+}
+
+/// Like [`generate`], with the scopes, currencies or amounts overridden by `shape`.
+///
+/// The overrides are applied to the customers after they are drawn and use no random
+/// numbers, so `Shape::default()` yields exactly the data of [`generate`].
+pub fn generate_shaped(seed: u64, n_invoices: usize, noise: &Noise, shape: &Shape) -> Dataset {
     let mut rng = Rng(seed);
-    let customers: Vec<Customer> = (0..(n_invoices / 10).max(1))
+    let mut customers: Vec<Customer> = (0..(n_invoices / 10).max(1))
         .map(|_| customer(&mut rng))
         .collect();
+    for (index, c) in customers.iter_mut().enumerate() {
+        if let Some(scopes) = shape.scopes {
+            c.scope = format!("scope-{}", index % scopes.max(1));
+        }
+        if shape.single_currency {
+            c.currency = "EUR";
+        }
+        if let Some(amounts) = shape.distinct_amounts {
+            c.fixed_amount = Some(100_000 + (index % amounts.max(1)) as i64 * 2_500);
+        }
+    }
     let base = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
 
     let mut invoices: Vec<Invoice> = Vec::new();
