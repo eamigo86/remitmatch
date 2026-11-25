@@ -281,8 +281,9 @@ at 1,000,000 payments the times are 4.244 s for `remitmatch`, 5.481 s for pure P
 
 Read the numbers with these caveats:
 
-- The data is synthetic, from the generator of the accuracy tests, and the default weights
-  were tuned on it. Precision here says nothing about real bank statements.
+- The data is synthetic, from a generator that mirrors the noise model of the accuracy tests.
+  The default weights have not been tuned. Precision here says nothing about real bank
+  statements.
 - In 95 % of the payments the reference contains the invoice number, in one of a few formats,
   which makes an exact dictionary lookup very effective. The baselines assume the invoice numbers start with `INV`;
   `remitmatch` does not need to know the prefix.
