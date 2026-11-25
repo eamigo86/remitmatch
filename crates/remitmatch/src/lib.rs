@@ -11,7 +11,9 @@
 //! Groups are also searched by counterparty when the reference does not name them: the
 //! open invoices (or payments) of a similar payer, inside the date window, whose amounts add
 //! up to the payment (or invoice) within tolerance.
-//! Payments and invoices only match inside the same scope and currency.
+//! Payments and invoices only match inside the same scope and currency; those partitions are
+//! processed in parallel with rayon (the thread count follows `RAYON_NUM_THREADS`), and the
+//! result never depends on the number of threads.
 //!
 //! All monetary amounts are integers in minor units (for example cents), never
 //! floating-point numbers.
