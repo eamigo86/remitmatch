@@ -49,6 +49,8 @@ convention = "google"
 
 [tool.mypy]
 strict = true
+# Check against the oldest supported Python, whatever interpreter runs mypy.
+python_version = "3.10"
 
 [[tool.mypy.overrides]]
 module = "pyarrow.*"

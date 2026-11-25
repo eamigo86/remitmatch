@@ -2,7 +2,7 @@
 
 from collections.abc import Sequence
 from datetime import date
-from typing import Self, final
+from typing import final
 
 import pyarrow
 
@@ -80,7 +80,7 @@ class Invoice:
         due_date: date,
         counterparty: str,
         scope: str = "default",
-    ) -> Self: ...
+    ) -> Invoice: ...
     @property
     def id(self) -> str:
         """Unique invoice identifier in the caller's system."""
@@ -142,7 +142,7 @@ class Payment:
         reference: str,
         counterparty: str,
         scope: str = "default",
-    ) -> Self: ...
+    ) -> Payment: ...
     @property
     def id(self) -> str:
         """Unique movement identifier from the bank feed."""
@@ -202,7 +202,7 @@ class MatchConfig:
         suggest_threshold: float = 0.60,
         ambiguity_margin: float = 0.05,
         weights: dict[str, float] | None = None,
-    ) -> Self: ...
+    ) -> MatchConfig: ...
     @property
     def amount_tolerance_minor(self) -> int:
         """Absolute amount difference accepted (e.g. bank fees)."""
@@ -265,7 +265,7 @@ class Match:
         score: float,
         breakdown: dict[str, float],
         residual_minor: int,
-    ) -> Self: ...
+    ) -> Match: ...
     @property
     def kind(self) -> MatchKind:
         """Cardinality of the match: a MatchKind member."""
@@ -326,7 +326,7 @@ class ReconciliationResult:
         matches: Sequence[Match],
         unmatched_payments: Sequence[str],
         unmatched_invoices: Sequence[str],
-    ) -> Self: ...
+    ) -> ReconciliationResult: ...
     @property
     def matches(self) -> list[Match]:
         """Proposed matches, best score first.
