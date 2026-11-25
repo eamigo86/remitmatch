@@ -674,8 +674,7 @@ impl Engine<'_> {
                 .collect(),
             |p| self.payments[p].value_date,
         );
-        let names = payments.iter().map(|&p| self.payment_name[p].as_str());
-        let similar = similar_buckets(names, &invoices);
+        let mut similar = SimilarBuckets::new(&invoices);
         for p in payments {
             // Without a free mentioned invoice every group has reference share 0.
             let names_one = mentions
@@ -689,8 +688,7 @@ impl Engine<'_> {
             let limit = i128::from(pay.amount_minor) + i128::from(self.tolerance);
             let pool = similar
                 .get(self.payment_name[p].as_str())
-                .into_iter()
-                .flatten()
+                .iter()
                 .flat_map(|rows| rows.iter().copied())
                 .filter(|&i| {
                     let inv = &self.invoices[i];
@@ -738,8 +736,7 @@ impl Engine<'_> {
                 .collect(),
             |i| self.invoices[i].due_date,
         );
-        let names = invoices.iter().map(|&i| self.invoice_name[i].as_str());
-        let similar = similar_buckets(names, &payments);
+        let mut similar = SimilarBuckets::new(&payments);
         // Invoices that some payment of the partition names; any other has share 0.
         let named: HashSet<usize> = mentions.values().flatten().copied().collect();
         for i in invoices {
@@ -751,8 +748,7 @@ impl Engine<'_> {
             let limit = i128::from(inv.amount_minor) + i128::from(self.tolerance);
             let pool = similar
                 .get(self.invoice_name[i].as_str())
-                .into_iter()
-                .flatten()
+                .iter()
                 .flat_map(|rows| rows.iter().copied())
                 .filter(|&p| {
                     let pay = &self.payments[p];
@@ -892,25 +888,36 @@ fn by_name<'a>(
 
 /// Finds, for each distinct anchor name, the buckets whose name reaches the threshold.
 ///
-/// Names are compared once per distinct pair, not once per row pair.
+/// Names are compared once per distinct pair, not once per row pair, and only for the anchor
+/// names that are asked for: an anchor that is skipped costs nothing.
 // ponytail: distinct anchor names x distinct bucket names Jaro-Winkler comparisons per
 // partition. Upgrade: block the names (first letters or n-grams) before comparing if a
 // partition holds tens of thousands of distinct names.
-fn similar_buckets<'a, 'b>(
-    anchor_names: impl Iterator<Item = &'a str>,
-    buckets: &'b BTreeMap<&str, Vec<usize>>,
-) -> HashMap<&'a str, Vec<&'b Vec<usize>>> {
-    let mut similar: HashMap<&str, Vec<&Vec<usize>>> = HashMap::new();
-    for name in anchor_names {
-        similar.entry(name).or_insert_with(|| {
+struct SimilarBuckets<'a, 'b> {
+    buckets: &'b BTreeMap<&'a str, Vec<usize>>,
+    cache: HashMap<&'b str, Vec<&'b Vec<usize>>>,
+}
+
+impl<'a, 'b> SimilarBuckets<'a, 'b> {
+    /// Starts with no name compared.
+    fn new(buckets: &'b BTreeMap<&'a str, Vec<usize>>) -> Self {
+        Self {
+            buckets,
+            cache: HashMap::new(),
+        }
+    }
+
+    /// Returns the buckets similar to `name`, comparing on the first request for that name.
+    fn get(&mut self, name: &'b str) -> &[&'b Vec<usize>] {
+        let buckets = self.buckets;
+        self.cache.entry(name).or_insert_with(|| {
             buckets
                 .iter()
                 .filter(|&(&other, _)| meets(name_signal(name, other), GROUP_NAME_THRESHOLD))
                 .map(|(_, rows)| rows)
                 .collect()
-        });
+        })
     }
-    similar
 }
 
 /// Orders rows by date and then input index, so a truncated pool keeps the oldest rows.
