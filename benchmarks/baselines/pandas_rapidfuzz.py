@@ -37,15 +37,15 @@ _SUFFIXES = r"\b(?:SL|SA|LLC|INC|GMBH|LTD)\b"
 
 
 def _frame(rows: Sequence[Invoice] | Sequence[Payment] | pd.DataFrame) -> pd.DataFrame:
-    """Return the rows as a DataFrame with a fresh range index, copying a given frame.
+    """Return the rows as a DataFrame with a range index; the input is never modified.
 
     Args:
         rows: Rows as named tuples, or an existing DataFrame.
 
     Returns:
-        A DataFrame the caller does not share.
+        A DataFrame with the rows and a range index.
     """
-    frame = rows.copy() if isinstance(rows, pd.DataFrame) else pd.DataFrame(list(rows))
+    frame = rows if isinstance(rows, pd.DataFrame) else pd.DataFrame(list(rows))
     return frame.reset_index(drop=True)
 
 

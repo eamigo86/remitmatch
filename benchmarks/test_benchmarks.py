@@ -1,15 +1,20 @@
 """Tests of the benchmark data generator, the baselines and the metric computation."""
 
 import datetime
+import json
 import re
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
 pytest.importorskip("pandas")
 pytest.importorskip("rapidfuzz")
+pytest.importorskip("matplotlib")
 
 import generate  # noqa: E402
+import plot  # noqa: E402
+import run  # noqa: E402
 from baselines import pandas_rapidfuzz, pure_python  # noqa: E402
 
 BASELINES = [
@@ -317,3 +322,119 @@ def test_the_two_baselines_agree() -> None:
     a = {(tuple(p), tuple(i)) for p, i in pure_python.match(data.invoices, data.payments, 300)}
     b = {(tuple(p), tuple(i)) for p, i in pandas_rapidfuzz.match(data.invoices, data.payments, 300)}
     assert len(a & b) / len(a | b) >= 0.97
+
+
+def test_pick_best_prefers_the_fastest_finished_run() -> None:
+    """The best run is the fastest one that finished; none is picked when none finished."""
+    runs = [
+        {"status": "ok", "time_match": 2.0},
+        {"status": "ok", "time_match": 1.5},
+        {"status": "did_not_finish"},
+    ]
+    assert run.pick_best(runs) == runs[1]
+    assert run.pick_best([{"status": "did_not_finish"}]) is None
+    assert run.pick_best([]) is None
+
+
+def test_peak_memory_unit_follows_the_platform() -> None:
+    """The operating system reports the peak resident size in bytes or in kilobytes."""
+    assert run.peak_rss_bytes(1000, "darwin") == 1000
+    assert run.peak_rss_bytes(1000, "linux") == 1_024_000
+
+
+def _small_run(tmp_path: Path, *extra: str) -> dict[str, object]:
+    """Run the benchmark on a tiny dataset and read the results file.
+
+    Args:
+        tmp_path: Directory for the results file.
+        *extra: Further command line arguments.
+
+    Returns:
+        The parsed results file.
+    """
+    output = tmp_path / "results.json"
+    code = run.main(
+        ["--sizes", "2000", "--datasets", "one-to-one", "--output", str(output), *extra]
+    )
+    assert code == 0
+    return json.loads(output.read_text(encoding="utf-8"))  # type: ignore[no-any-return]
+
+
+def test_runner_measures_every_implementation(tmp_path: Path) -> None:
+    """Each implementation runs in its own process and reports time, memory and accuracy.
+
+    Args:
+        tmp_path: Directory for the results file.
+    """
+    data = _small_run(tmp_path, "--runs", "2", "--remitmatch-build", "test")
+    meta = data["meta"]
+    assert meta["sizes"] == [2000]
+    assert meta["scopes"] == 4
+    assert meta["seed"] == 1
+    assert meta["machine"]["cpu_count"] >= 1
+    assert meta["packages"]["remitmatch"]["build"] == "test"
+    assert {r["implementation"] for r in data["results"]} == {
+        "remitmatch",
+        "pure-python",
+        "pandas-rapidfuzz",
+    }
+    for result in data["results"]:
+        assert result["status"] == "ok"
+        assert len(result["runs"]) == 2
+        best = result["best"]
+        assert best["time_match"] > 0
+        assert best["peak_rss_bytes"] >= best["rss_after_load_bytes"] > 0
+        assert 0.9 <= best["precision"] <= 1.0
+        assert 0.5 <= best["recall"] <= 1.0
+    remitmatch = next(r for r in data["results"] if r["implementation"] == "remitmatch")
+    assert 0.9 <= remitmatch["best"]["auto_precision"] <= 1.0
+    assert remitmatch["best"]["time_call"] <= remitmatch["best"]["time_match"]
+
+
+def test_a_run_over_the_limit_is_recorded_as_not_finished(tmp_path: Path) -> None:
+    """With a zero time limit the matching call is cut off and the result says so.
+
+    Args:
+        tmp_path: Directory for the results file.
+    """
+    data = _small_run(tmp_path, "--implementations", "pure-python", "--timeout", "0")
+    [result] = data["results"]
+    assert result["status"] == "did_not_finish"
+    assert result["best"] is None
+    assert result["runs"][0]["status"] == "did_not_finish"
+
+
+def test_plot_draws_the_chart_files(tmp_path: Path) -> None:
+    """The chart is written as PNG and SVG, and a line stops where a run did not finish.
+
+    Args:
+        tmp_path: Directory for the chart files.
+    """
+
+    def entry(name: str, size: int, seconds: float | None) -> dict[str, object]:
+        best = None if seconds is None else {"time_match": seconds}
+        return {
+            "implementation": name,
+            "dataset": "one-to-one",
+            "size": size,
+            "status": "ok" if seconds else "did_not_finish",
+            "best": best,
+        }
+
+    results = {
+        "meta": {"machine": {"model": "Test CPU", "cpu_count": 4}, "runs_per_size": 3},
+        "results": [
+            entry("remitmatch", 10_000, 0.05),
+            entry("remitmatch", 100_000, 0.7),
+            entry("pure-python", 10_000, 0.03),
+            entry("pure-python", 100_000, 0.5),
+            entry("pandas-rapidfuzz", 10_000, 0.03),
+            entry("pandas-rapidfuzz", 100_000, None),
+        ],
+    }
+    source = tmp_path / "results.json"
+    source.write_text(json.dumps(results), encoding="utf-8")
+    png, svg = tmp_path / "time.png", tmp_path / "time.svg"
+    plot.draw(source, png, svg)
+    assert png.read_bytes().startswith(b"\x89PNG")
+    assert svg.read_text(encoding="utf-8").lstrip().startswith(("<?xml", "<svg"))
