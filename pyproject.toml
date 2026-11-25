@@ -70,3 +70,10 @@ dev = [
     "pytest>=9.2.0",
     "ruff>=0.17.6",
 ]
+# Benchmark comparison (benchmarks/); kept out of dev so CI does not install it.
+bench = [
+    "matplotlib>=3.8",
+    "pandas>=2.2",
+    "pyarrow>=14",
+    "rapidfuzz>=3.9",
+]
