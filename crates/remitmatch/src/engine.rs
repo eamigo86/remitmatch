@@ -86,6 +86,9 @@ struct Engine<'a> {
     invoice_name: Vec<String>,
     payment_reference: Vec<Reference>,
     payment_name: Vec<String>,
+    /// Whether a candidate with no reference signal can neither be accepted nor make another
+    /// candidate of its anchor ambiguous; see [`cannot_matter`].
+    skip_unnamed: bool,
 }
 
 /// Which rows of one partition are already matched, plus the matches found so far.
@@ -173,6 +176,7 @@ pub(crate) fn reconcile(
             .iter()
             .map(|p| normalize_name(&p.counterparty))
             .collect(),
+        skip_unnamed: cannot_matter(&Weights::from_map(&config.weights), config, 0.0),
     };
     let partitions = engine.partitions();
     let partitions: Vec<&PartitionRows> = partitions.values().collect();
@@ -201,6 +205,25 @@ pub(crate) fn reconcile(
         unmatched_payments: unmatched(payments.iter().map(|p| &p.id), &payment_taken),
         unmatched_invoices: unmatched(invoices.iter().map(|i| &i.id), &invoice_taken),
     })
+}
+
+/// Returns whether a candidate whose reference signal is at most `reference` can be ignored.
+///
+/// Its score is at most the one with the other three signals at 1. When that bound is below
+/// the suggest threshold by at least the ambiguity margin (and also fails the acceptance
+/// test, which matters for a margin of 0), the candidate cannot be accepted. It cannot make
+/// an accepted candidate of its anchor ambiguous either, because that needs a score within
+/// the margin of the accepted one, which scores at least the threshold.
+fn cannot_matter(weights: &Weights, config: &MatchConfig, reference: f64) -> bool {
+    let best = Signals {
+        reference,
+        amount: 1.0,
+        name: 1.0,
+        date: 1.0,
+    };
+    let bound = weighted_score(&best, weights);
+    bound <= config.suggest_threshold - config.ambiguity_margin
+        && !meets(bound, config.suggest_threshold)
 }
 
 /// Returns the ids whose rows were not taken, in input order.
@@ -585,6 +608,10 @@ impl Engine<'_> {
         open: &[(i64, usize)],
         explained: bool,
     ) -> Vec<Candidate> {
+        if explained && self.skip_unnamed {
+            // Every candidate of an explained payment has reference 0: none can matter.
+            return Vec::new();
+        }
         let pay = &self.payments[payment];
         let tolerance = self.config.amount_tolerance_minor;
         let low = pay.amount_minor.saturating_sub(tolerance);
@@ -650,6 +677,13 @@ impl Engine<'_> {
         let names = payments.iter().map(|&p| self.payment_name[p].as_str());
         let similar = similar_buckets(names, &invoices);
         for p in payments {
+            // Without a free mentioned invoice every group has reference share 0.
+            let names_one = mentions
+                .get(&p)
+                .is_some_and(|set| set.iter().any(|&i| !state.invoice_taken(i)));
+            if self.skip_unnamed && !names_one {
+                continue;
+            }
             let mut candidates = Vec::new();
             let pay = &self.payments[p];
             let limit = i128::from(pay.amount_minor) + i128::from(self.tolerance);
@@ -706,7 +740,12 @@ impl Engine<'_> {
         );
         let names = invoices.iter().map(|&i| self.invoice_name[i].as_str());
         let similar = similar_buckets(names, &payments);
+        // Invoices that some payment of the partition names; any other has share 0.
+        let named: HashSet<usize> = mentions.values().flatten().copied().collect();
         for i in invoices {
+            if self.skip_unnamed && !named.contains(&i) {
+                continue;
+            }
             let mut candidates = Vec::new();
             let inv = &self.invoices[i];
             let limit = i128::from(inv.amount_minor) + i128::from(self.tolerance);
@@ -918,6 +957,29 @@ mod tests {
             }
         }
         (invoices, payments)
+    }
+
+    #[test]
+    fn the_default_weights_prune_candidates_without_a_reference_signal() {
+        let config = MatchConfig::default();
+        let weights = Weights::from_map(&config.weights);
+        // 0.55 against 0.60 - 0.05: the bound holds, so the skip really applies.
+        assert!(cannot_matter(&weights, &config, 0.0));
+        // With any reference signal the bound rises above the threshold minus the margin.
+        assert!(!cannot_matter(&weights, &config, 0.2));
+        assert!(!cannot_matter(&weights, &config, 1.0));
+    }
+
+    #[test]
+    fn a_zero_margin_never_prunes_a_candidate_that_can_be_accepted() {
+        // The bound 0.55 equals the threshold, so a perfect candidate would be accepted.
+        let config = MatchConfig {
+            suggest_threshold: 0.55,
+            ambiguity_margin: 0.0,
+            ..MatchConfig::default()
+        };
+        let weights = Weights::from_map(&config.weights);
+        assert!(!cannot_matter(&weights, &config, 0.0));
     }
 
     #[test]
