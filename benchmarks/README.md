@@ -182,9 +182,10 @@ What the baselines do not do:
 - The baselines were written to be fast, not to be slow. Their recall and precision are
   within 0.2 points of `remitmatch` on one-to-one data, so they do the same job on this data.
   Where a choice was open, the faster correct formulation was kept (see below).
-- The data comes from the generator that the accuracy tests of `remitmatch` use, with the same
-  noise model, and the default weights of `remitmatch` were tuned on it. Real bank statements
-  are different, so these numbers say nothing about accuracy in production.
+- The data comes from `generate.py`, a Python generator that mirrors the noise model of the
+  generator used by the accuracy tests of `remitmatch`. The default weights of `remitmatch`
+  have not been tuned on either. Real bank statements are different, so these numbers say
+  nothing about accuracy in production.
 - The data has references that contain the invoice number, which is what makes an exact
   dictionary lookup so effective. Data where references are noisier would cost the baselines
   more than the engine.
