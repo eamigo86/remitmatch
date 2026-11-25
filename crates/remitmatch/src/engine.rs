@@ -237,7 +237,7 @@ fn reconcile_validated(
         payment_name: Names::new(payments, parallel, |p| p.counterparty.as_str()),
         skip_unnamed: cannot_matter(&Weights::from_map(&config.weights), config, 0.0),
     };
-    let partitions = engine.partitions();
+    let partitions = partitions(invoices, payments);
     let partitions: Vec<&PartitionRows> = partitions.values().collect();
     // Partitions share no rows. Each touches only the flags of its own rows and
     // keeps its own matches; the outcomes are collected in partition order, so the result
@@ -318,13 +318,14 @@ fn unmatched<'a>(ids: impl Iterator<Item = &'a String>, taken: &[AtomicBool]) ->
 /// Rejects duplicate ids and out-of-range configuration.
 fn validate(invoices: &[Invoice], payments: &[Payment], config: &MatchConfig) -> Result<(), Error> {
     validate_config(config)?;
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::with_capacity(invoices.len());
     for invoice in invoices {
         if !seen.insert(invoice.id.as_str()) {
             return Err(Error::DuplicateInvoiceId(invoice.id.clone()));
         }
     }
     seen.clear();
+    seen.reserve(payments.len());
     for payment in payments {
         if !seen.insert(payment.id.as_str()) {
             return Err(Error::DuplicatePaymentId(payment.id.clone()));
@@ -390,31 +391,43 @@ fn is_mention(reference: &Reference, start: usize, end: usize) -> bool {
     !splits_digits(start) && !splits_digits(end)
 }
 
-impl Engine<'_> {
-    /// Groups the rows with a positive amount by scope and upper-cased currency.
-    fn partitions(&self) -> BTreeMap<(&str, String), PartitionRows> {
-        let mut partitions: BTreeMap<(&str, String), PartitionRows> = BTreeMap::new();
-        for (i, invoice) in self.invoices.iter().enumerate() {
-            if invoice.amount_minor > 0 {
-                let key = (
-                    invoice.scope.as_str(),
-                    invoice.currency.to_ascii_uppercase(),
-                );
-                partitions.entry(key).or_default().0.push(i);
-            }
+/// Groups the rows with a positive amount by scope and upper-cased currency.
+fn partitions<'a>(
+    invoices: &'a [Invoice],
+    payments: &'a [Payment],
+) -> BTreeMap<(&'a str, String), PartitionRows> {
+    // Rows are first grouped by the raw pair, which costs no allocation per row.
+    let mut raw: HashMap<(&'a str, &'a str), PartitionRows> = HashMap::new();
+    for (i, invoice) in invoices.iter().enumerate() {
+        if invoice.amount_minor > 0 {
+            let key = (invoice.scope.as_str(), invoice.currency.as_str());
+            raw.entry(key).or_default().0.push(i);
         }
-        for (p, payment) in self.payments.iter().enumerate() {
-            if payment.amount_minor > 0 {
-                let key = (
-                    payment.scope.as_str(),
-                    payment.currency.to_ascii_uppercase(),
-                );
-                partitions.entry(key).or_default().1.push(p);
-            }
-        }
-        partitions
     }
+    for (p, payment) in payments.iter().enumerate() {
+        if payment.amount_minor > 0 {
+            let key = (payment.scope.as_str(), payment.currency.as_str());
+            raw.entry(key).or_default().1.push(p);
+        }
+    }
+    let mut partitions: BTreeMap<(&str, String), PartitionRows> = BTreeMap::new();
+    for ((scope, currency), (invoice_rows, payment_rows)) in raw {
+        let entry = partitions
+            .entry((scope, currency.to_ascii_uppercase()))
+            .or_default();
+        let merged = !entry.0.is_empty() || !entry.1.is_empty();
+        entry.0.extend(invoice_rows);
+        entry.1.extend(payment_rows);
+        if merged {
+            // Currencies that differ only in case share a partition; keep input order.
+            entry.0.sort_unstable();
+            entry.1.sort_unstable();
+        }
+    }
+    partitions
+}
 
+impl Engine<'_> {
     /// Runs the reference passes, the 1:1 candidate pass and the counterparty group passes
     /// on one partition.
     fn run_partition(
@@ -1101,6 +1114,35 @@ mod tests {
         let (sequential, parallel) = (build(false), build(true));
         assert_eq!(sequential.ids, parallel.ids);
         assert_eq!(sequential.distinct, parallel.distinct);
+    }
+
+    #[test]
+    fn currencies_that_differ_only_in_case_share_a_partition_in_input_order() {
+        let (invoices, payments) = many_partitions(2);
+        let recase =
+            |k: usize, currency: &str| k.is_multiple_of(2).then(|| currency.to_ascii_lowercase());
+        let invoices: Vec<Invoice> = invoices
+            .into_iter()
+            .enumerate()
+            .map(|(k, i)| Invoice {
+                currency: recase(k, &i.currency).unwrap_or(i.currency),
+                ..i
+            })
+            .collect();
+        let payments: Vec<Payment> = payments
+            .into_iter()
+            .enumerate()
+            .map(|(k, p)| Payment {
+                currency: recase(k + 1, &p.currency).unwrap_or(p.currency),
+                ..p
+            })
+            .collect();
+        let groups = partitions(&invoices, &payments);
+        assert_eq!(groups.len(), 2, "one partition per scope");
+        for (_, (invoice_rows, payment_rows)) in groups {
+            assert!(invoice_rows.is_sorted() && payment_rows.is_sorted());
+            assert_eq!((invoice_rows.len(), payment_rows.len()), (6, 5));
+        }
     }
 
     #[test]
