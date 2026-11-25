@@ -9,10 +9,12 @@
 //! - `MatchKind` and `MatchStatus` are plain Python enums in `remitmatch._enums`; the native
 //!   code imports them on first use and converts through their string values.
 //! - `reconcile` copies its inputs, releases the GIL while the core runs and maps
-//!   [`remitmatch::Error`] to `ValueError`. Inputs that are not sequences of the expected
-//!   classes raise `TypeError` during argument conversion.
+//!   [`remitmatch::Error`] to `ValueError`. Each input is a sequence of the expected classes
+//!   or an Arrow table (see the `arrow` module); anything else raises `TypeError`.
 //! - Docstrings on the Python-facing items follow the Python documentation rules of the
 //!   project (Google style, no backticks), because they become `__doc__`.
+
+mod arrow;
 
 use std::collections::BTreeMap;
 
@@ -692,32 +694,61 @@ impl PyReconciliationResult {
 /// Runs in Rust and releases the GIL. Each invoice and payment appears in at most one
 /// match. The inputs are copied before matching starts.
 ///
+/// Each of invoices and payments is either a sequence of objects or an Arrow table: any
+/// object that exports the Arrow C stream, such as a pyarrow Table or RecordBatchReader or
+/// a Polars DataFrame. The two arguments are independent. Table columns are matched by name
+/// and extra columns are ignored. Invoices need id, number, amount_minor, currency,
+/// issue_date, due_date and counterparty; payments need id, amount_minor, currency,
+/// value_date, reference and counterparty; both accept an optional scope column, and a
+/// missing one means the default scope. Text columns may be any Arrow string type or a
+/// dictionary of strings, amount_minor any integer type that fits a signed 64-bit integer,
+/// and dates date32 or date64. Floats, decimals and timestamps are rejected.
+///
 /// Args:
-///     invoices: Open invoices to settle, as a sequence such as a list or tuple. Any
-///         sequence except a string is accepted.
-///     payments: Bank movements received, as a sequence such as a list or tuple. Any
-///         sequence except a string is accepted.
+///     invoices: Open invoices to settle, as a sequence such as a list or tuple (any
+///         sequence except a string) or as an Arrow table.
+///     payments: Bank movements received, as a sequence such as a list or tuple (any
+///         sequence except a string) or as an Arrow table.
 ///     config: Tolerances and thresholds; defaults to MatchConfig().
 ///
 /// Returns:
 ///     Matches with per-signal breakdown, plus unmatched ids on each side.
 ///
 /// Raises:
-///     ValueError: An id repeats on one side, the config is invalid, or the reference index
-///         cannot be built.
-///     TypeError: An input is not a sequence of the expected objects.
+///     ValueError: An id repeats on one side, the config is invalid, the reference index
+///         cannot be built, a table lacks a required column or has a null or an invalid
+///         date in a used column, or the Arrow stream cannot be read.
+///     TypeError: An input is neither a sequence of the expected objects nor an Arrow
+///         stream, or a table column has an unsupported Arrow type.
+///     OverflowError: An integer value in a table does not fit a signed 64-bit integer.
 #[pyfunction]
 #[pyo3(signature = (invoices, payments, config=None))]
 fn reconcile(
     py: Python<'_>,
-    invoices: Vec<PyInvoice>,
-    payments: Vec<PyPayment>,
+    invoices: &Bound<'_, PyAny>,
+    payments: &Bound<'_, PyAny>,
     config: Option<PyMatchConfig>,
 ) -> PyResult<PyReconciliationResult> {
     // ponytail: inputs are copied into core structs (and results copied back), O(n) extra
-    // memory; borrow from the frozen Python objects instead if copies ever dominate the run.
-    let invoices: Vec<Invoice> = invoices.into_iter().map(|i| i.0).collect();
-    let payments: Vec<Payment> = payments.into_iter().map(|p| p.0).collect();
+    // memory; borrow from the frozen Python objects or from the Arrow buffers instead (a
+    // columnar core API) if copies ever dominate the run. Arrow input creates no Python
+    // object per row, but each value is still copied once.
+    let invoices: Vec<Invoice> = match arrow::read_stream(invoices)? {
+        Some(batches) => py.detach(|| arrow::invoices(&batches))?,
+        None => invoices
+            .extract::<Vec<PyInvoice>>()?
+            .into_iter()
+            .map(|i| i.0)
+            .collect(),
+    };
+    let payments: Vec<Payment> = match arrow::read_stream(payments)? {
+        Some(batches) => py.detach(|| arrow::payments(&batches))?,
+        None => payments
+            .extract::<Vec<PyPayment>>()?
+            .into_iter()
+            .map(|p| p.0)
+            .collect(),
+    };
     let config = config.map_or_else(MatchConfig::default, |c| c.0);
     py.detach(|| remitmatch::reconcile(&invoices, &payments, &config))
         .map(PyReconciliationResult)
