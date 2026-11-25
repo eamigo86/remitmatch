@@ -1,6 +1,7 @@
 //! Signal functions and the weighted score of a payment-invoice candidate.
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use chrono::NaiveDate;
 
@@ -119,6 +120,25 @@ impl CharCounts {
     }
 }
 
+/// Character counts that are built on first use and kept, so a text that never reaches the
+/// prefilter is never counted.
+#[derive(Default)]
+pub(crate) struct LazyCounts(OnceLock<CharCounts>);
+
+impl LazyCounts {
+    /// Returns the counts of `text`, building them on the first call; later calls ignore
+    /// their argument, so every call must pass the same text.
+    pub(crate) fn get(&self, text: &str) -> &CharCounts {
+        self.0.get_or_init(|| CharCounts::of(text))
+    }
+
+    /// Returns whether the counts have been built.
+    #[cfg(test)]
+    fn is_built(&self) -> bool {
+        self.0.get().is_some()
+    }
+}
+
 /// Finds the best approximate occurrence of `number` inside `reference`.
 ///
 /// Both arguments are normalized. Returns 0 when `number` occurs exactly: the caller only
@@ -131,21 +151,24 @@ impl CharCounts {
 // and do not materialize candidates below the suggest threshold.
 ///
 /// With `counts`, a prefilter on character counts runs first.
-/// `counts` holds the counts of `number` and of `reference`. A similarity of at least the
+/// `counts` holds the lazily built counts of `number` and of `reference`. A similarity of at least the
 /// floor allows at most `(len + 1) / 5` edits for a number of `len` characters (the windows
 /// are at most `len + 1` long), and every edit repairs at most one character missing from the
 /// reference, so a number with more missing characters scores 0 without the window search.
 pub(crate) fn fuzzy_reference_signal_with(
     number: &str,
     reference: &str,
-    counts: Option<(&CharCounts, &CharCounts)>,
+    counts: Option<(&LazyCounts, &LazyCounts)>,
 ) -> f64 {
     let n = number.chars().count();
     if n < FUZZY_MIN_LEN || reference.contains(number) {
         return 0.0;
     }
     if let Some((number_counts, reference_counts)) = counts
-        && number_counts.missing_from(reference_counts) > (n + 1) / 5
+        && number_counts
+            .get(number)
+            .missing_from(reference_counts.get(reference))
+            > (n + 1) / 5
     {
         return 0.0;
     }
@@ -318,8 +341,40 @@ mod tests {
         fuzzy_reference_signal_with(
             number,
             reference,
-            Some((&CharCounts::of(number), &CharCounts::of(reference))),
+            Some((&LazyCounts::default(), &LazyCounts::default())),
         )
+    }
+
+    #[test]
+    fn counts_are_built_only_when_the_prefilter_needs_them() {
+        // A number below the minimum length and a number found verbatim never reach it.
+        for (number, reference) in [("A12", "PAGO A13"), ("INV2024001", "PAGO INV2024001")] {
+            let (number_counts, reference_counts) = (LazyCounts::default(), LazyCounts::default());
+            fuzzy_reference_signal_with(
+                number,
+                reference,
+                Some((&number_counts, &reference_counts)),
+            );
+            assert!(
+                !number_counts.is_built() && !reference_counts.is_built(),
+                "{number}"
+            );
+        }
+        // A partial occurrence does, and each side is counted from its own text.
+        let (number_counts, reference_counts) = (LazyCounts::default(), LazyCounts::default());
+        let score = fuzzy_reference_signal_with(
+            "INV2024001",
+            "PAGO INV2024010 GRACIAS",
+            Some((&number_counts, &reference_counts)),
+        );
+        assert!(score >= FUZZY_FLOOR);
+        assert!(number_counts.is_built() && reference_counts.is_built());
+        assert_eq!(
+            number_counts
+                .get("ignored")
+                .missing_from(reference_counts.get("ignored")),
+            0
+        );
     }
 
     #[test]
