@@ -9,8 +9,8 @@ use rayon::prelude::*;
 
 use crate::normalize::{Reference, normalize_name, normalize_reference};
 use crate::score::{
-    EPS, Signals, Weights, amount_signal, breakdown, date_signal, fuzzy_reference_signal, meets,
-    name_signal, weighted_score,
+    CharCounts, EPS, Signals, Weights, amount_signal, breakdown, date_signal,
+    fuzzy_reference_signal_with, meets, name_signal, weighted_score,
 };
 use crate::subset::{GROUP_CANDIDATE_LIMIT, GROUP_SUBSET_LIMIT, find_subsets};
 use crate::{
@@ -86,6 +86,10 @@ struct Engine<'a> {
     invoice_name: Vec<String>,
     payment_reference: Vec<Reference>,
     payment_name: Vec<String>,
+    /// Character counts of each normalized invoice number, for the fuzzy reference prefilter.
+    invoice_number_counts: Vec<CharCounts>,
+    /// Character counts of each normalized payment reference.
+    payment_reference_counts: Vec<CharCounts>,
     /// Whether a candidate with no reference signal can neither be accepted nor make another
     /// candidate of its anchor ambiguous; see [`cannot_matter`].
     skip_unnamed: bool,
@@ -154,24 +158,31 @@ pub(crate) fn reconcile(
     config: &MatchConfig,
 ) -> Result<ReconciliationResult, Error> {
     validate(invoices, payments, config)?;
+    let invoice_number: Vec<String> = invoices
+        .iter()
+        .map(|i| normalize_reference(&i.number).text)
+        .collect();
+    let payment_reference: Vec<Reference> = payments
+        .iter()
+        .map(|p| normalize_reference(&p.reference))
+        .collect();
     let engine = Engine {
         invoices,
         payments,
         config,
         weights: Weights::from_map(&config.weights),
         tolerance: u64::try_from(config.amount_tolerance_minor).unwrap_or(0),
-        invoice_number: invoices
-            .iter()
-            .map(|i| normalize_reference(&i.number).text)
-            .collect(),
+        invoice_number_counts: invoice_number.iter().map(|n| CharCounts::of(n)).collect(),
+        invoice_number,
         invoice_name: invoices
             .iter()
             .map(|i| normalize_name(&i.counterparty))
             .collect(),
-        payment_reference: payments
+        payment_reference_counts: payment_reference
             .iter()
-            .map(|p| normalize_reference(&p.reference))
+            .map(|r| CharCounts::of(&r.text))
             .collect(),
+        payment_reference,
         payment_name: payments
             .iter()
             .map(|p| normalize_name(&p.counterparty))
@@ -625,9 +636,13 @@ impl Engine<'_> {
                 let reference = if explained {
                     0.0
                 } else {
-                    fuzzy_reference_signal(
+                    fuzzy_reference_signal_with(
                         &self.invoice_number[i],
                         &self.payment_reference[payment].text,
+                        Some((
+                            &self.invoice_number_counts[i],
+                            &self.payment_reference_counts[payment],
+                        )),
                     )
                 };
                 self.candidate(
