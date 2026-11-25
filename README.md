@@ -146,9 +146,9 @@ all of them support `copy` and `pickle`. `reconcile` releases the GIL while it r
   payment with a fee is often `suggested` rather than `auto`.
 - **Use `scope`.** It keeps companies apart and keeps runs fast: partitions (scope and
   currency) run in parallel, and the thread count follows `RAYON_NUM_THREADS`. Cost still
-  grows quadratically inside one scope. In a release build on a 16-thread machine, 10,000
-  invoices and payments take about 0.05 s, 100,000 spread over a few scopes about 0.7 s, and
-  400,000 rows in one scope about 3 s.
+  grows quadratically inside one scope. In a release build on an Apple M3 Max (16 threads),
+  10,000 invoices and payments take about 0.02 s, 100,000 spread over a few scopes about
+  0.25 s, and 400,000 rows in one scope about 1.8 s.
 - **Threads and fork.** `reconcile` runs on a thread pool whose size follows
   `RAYON_NUM_THREADS`. A process forked after its parent already called `reconcile` (Celery
   prefork, gunicorn preload, `multiprocessing` with `fork`) runs it sequentially, because the
