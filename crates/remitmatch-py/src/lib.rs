@@ -11,6 +11,8 @@
 //! - `reconcile` copies its inputs, releases the GIL while the core runs and maps
 //!   [`remitmatch::Error`] to `ValueError`. Each input is a sequence of the expected classes
 //!   or an Arrow table (see the `arrow` module); anything else raises `TypeError`.
+//! - A result shares its matches with the `Match` objects it hands out, so reading
+//!   `matches` does not copy them.
 //! - `ReconciliationResult.to_arrow` returns a `pyarrow.Table`; pyarrow is imported only when
 //!   it is called, so it stays an optional dependency.
 //! - Docstrings on the Python-facing items follow the Python documentation rules of the
@@ -19,6 +21,7 @@
 mod arrow;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use chrono::NaiveDate;
 use pyo3::exceptions::{PyImportError, PyModuleNotFoundError, PyTypeError, PyValueError};
@@ -515,7 +518,7 @@ impl PyMatchConfig {
 ///     OverflowError: An integer argument is outside the accepted range.
 #[pyclass(frozen, eq, from_py_object, module = "remitmatch", name = "Match")]
 #[derive(Clone, PartialEq)]
-struct PyMatch(Match);
+struct PyMatch(Arc<Match>);
 
 #[pymethods]
 impl PyMatch {
@@ -529,7 +532,7 @@ impl PyMatch {
         breakdown: BTreeMap<String, f64>,
         residual_minor: i64,
     ) -> PyResult<Self> {
-        Ok(Self(Match {
+        Ok(Self(Arc::new(Match {
             kind: kind_from_value(&enum_value(kind, &MATCH_KIND, "MatchKind")?)?,
             status: status_from_value(&enum_value(status, &MATCH_STATUS, "MatchStatus")?)?,
             payment_ids,
@@ -537,7 +540,7 @@ impl PyMatch {
             score,
             breakdown,
             residual_minor,
-        }))
+        })))
     }
 
     /// Cardinality of the match: a MatchKind member.
@@ -624,7 +627,23 @@ impl PyMatch {
     name = "ReconciliationResult"
 )]
 #[derive(Clone, PartialEq)]
-struct PyReconciliationResult(ReconciliationResult);
+struct PyReconciliationResult {
+    /// Shared with the `Match` objects returned by the `matches` getter.
+    matches: Vec<Arc<Match>>,
+    unmatched_payments: Vec<String>,
+    unmatched_invoices: Vec<String>,
+}
+
+impl From<ReconciliationResult> for PyReconciliationResult {
+    /// Moves each match into its own shared allocation.
+    fn from(result: ReconciliationResult) -> Self {
+        Self {
+            matches: result.matches.into_iter().map(Arc::new).collect(),
+            unmatched_payments: result.unmatched_payments,
+            unmatched_invoices: result.unmatched_invoices,
+        }
+    }
+}
 
 #[pymethods]
 impl PyReconciliationResult {
@@ -634,11 +653,11 @@ impl PyReconciliationResult {
         unmatched_payments: Vec<String>,
         unmatched_invoices: Vec<String>,
     ) -> Self {
-        Self(ReconciliationResult {
+        Self {
             matches: matches.into_iter().map(|m| m.0).collect(),
             unmatched_payments,
             unmatched_invoices,
-        })
+        }
     }
 
     /// Proposed matches, best score first.
@@ -647,7 +666,7 @@ impl PyReconciliationResult {
     /// repeatedly.
     #[getter]
     fn matches(&self) -> Vec<PyMatch> {
-        self.0.matches.iter().cloned().map(PyMatch).collect()
+        self.matches.iter().cloned().map(PyMatch).collect()
     }
 
     /// Payment ids with no acceptable candidate.
@@ -656,7 +675,7 @@ impl PyReconciliationResult {
     /// repeatedly.
     #[getter]
     fn unmatched_payments(&self) -> Vec<String> {
-        self.0.unmatched_payments.clone()
+        self.unmatched_payments.clone()
     }
 
     /// Invoice ids with no acceptable candidate.
@@ -665,7 +684,7 @@ impl PyReconciliationResult {
     /// repeatedly.
     #[getter]
     fn unmatched_invoices(&self) -> Vec<String> {
-        self.0.unmatched_invoices.clone()
+        self.unmatched_invoices.clone()
     }
 
     /// Return matches as a flat Arrow table (one row per payment-invoice pair).
@@ -703,7 +722,7 @@ impl PyReconciliationResult {
             error.set_cause(py, Some(cause));
             error
         })?;
-        let batch = py.detach(|| arrow::matches_batch(&self.0))?;
+        let batch = py.detach(|| arrow::matches_batch(&self.matches))?;
         let schema = batch.schema();
         PyTable::try_new(vec![batch], schema)?.into_pyarrow(py)
     }
@@ -784,9 +803,10 @@ fn reconcile(
             .collect(),
     };
     let config = config.map_or_else(MatchConfig::default, |c| c.0);
-    py.detach(|| remitmatch::reconcile(&invoices, &payments, &config))
-        .map(PyReconciliationResult)
-        .map_err(|error| PyValueError::new_err(error.to_string()))
+    py.detach(|| {
+        remitmatch::reconcile(&invoices, &payments, &config).map(PyReconciliationResult::from)
+    })
+    .map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
 /// Native extension module for remitmatch. Not part of the public API.

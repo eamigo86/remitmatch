@@ -22,7 +22,7 @@ use pyo3::exceptions::{PyOverflowError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 use pyo3_arrow::PyRecordBatchReader;
-use remitmatch::{Invoice, Match, Payment, ReconciliationResult};
+use remitmatch::{Invoice, Match, Payment};
 
 /// Milliseconds in one day, the unit of an Arrow `date64` value.
 const MILLIS_PER_DAY: i64 = 86_400_000;
@@ -274,10 +274,10 @@ fn dates(batch: &RecordBatch, name: &str) -> PyResult<Vec<NaiveDate>> {
 /// then payment order, then invoice order.
 ///
 /// A signal missing from a hand-built match breakdown is a null in its column.
-pub(crate) fn matches_batch(result: &ReconciliationResult) -> PyResult<RecordBatch> {
-    let pairs: Vec<(usize, &Match, &str, &str)> = result
-        .matches
+pub(crate) fn matches_batch(matches: &[Arc<Match>]) -> PyResult<RecordBatch> {
+    let pairs: Vec<(usize, &Match, &str, &str)> = matches
         .iter()
+        .map(Arc::as_ref)
         .enumerate()
         .flat_map(|(index, m)| {
             m.payment_ids.iter().flat_map(move |payment| {
