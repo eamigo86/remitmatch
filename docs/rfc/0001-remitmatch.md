@@ -330,7 +330,9 @@ A synthetic data generator with a known solution serves both the accuracy tests 
 | Size | 10k, 100k and 1M payments |
 | Compared against | Pure Python, pandas + rapidfuzz, reconPy |
 | Metrics | Total time, peak memory, precision and recall |
-| Tools | criterion (Rust), pytest-benchmark (Python) |
+| Tools | criterion (Rust), `benchmarks/run.py` (Python) |
+
+The Python benchmarks use a runner script instead of pytest-benchmark because each run needs its own process to measure peak memory. reconPy turned out not to fit the task (it has no absolute amount tolerance and joins on exact columns), so the measured comparison covers pure Python and pandas + rapidfuzz; see `benchmarks/README.md`.
 
 Results go in the README as a table and a chart, with the script to reproduce them. This is the part most likely to be shared on LinkedIn.
 
@@ -379,6 +381,8 @@ If week 4 runs long, 0.1.0 ships with 1:1 and 1:N only, and N:1 moves to 0.2.0.
 - [ ] No length cap on invoice numbers and counterparty names; the comparison cost grows quadratically with length (a 16,000-character field takes seconds)
 - [x] Run time, measured in a release build on an Apple M3 Max (16 threads) with rayon: 10,000 invoices and payments take about 0.013 s, 100,000 in four partitions about 0.18 s (the 5 s target for 100,000 is met), and 400,000 rows in one scope about 0.8 s; 1,000,000 mixed payments (grouped and partial) in one scope take about 5 s. Ceilings that remain: with weights that let no-reference matches score, the candidate pass is quadratic on rows sharing an amount and the counterparty passes compare every distinct name pair; normalization of the rows runs in parallel, but the duplicate-id check, the partitioning and, through Python, the copy of the input into core structs are serial and take about half of a 1,000,000-payment run on all threads; the counterparty group passes and assignment are sequential inside a partition
 - [x] The pre-release 0.1.0a1 was published on PyPI and crates.io (done 2026-11-25)
+- [x] The pre-release 0.1.0a2 was published on PyPI and crates.io (done 2026-11-25)
+- [ ] Speed-up of at least 20× over pandas + rapidfuzz: not met in the first benchmark (release build of 0.1.0a2, Apple M3 Max, one-to-one dataset). `remitmatch` is slower than the pandas + rapidfuzz baseline at every size measured: the speed-up is 0.78× at 10,000 payments, 0.68× at 100,000 and 0.76× at 1,000,000 (0.035 s, 0.339 s and 3.731 s against 0.027 s, 0.229 s and 2.824 s), and its peak memory is higher at 100,000 and 1,000,000 payments. It finds groups the baselines cannot (recall 93.9 to 94.9 % against 88.1 to 88.5 % on the mixed dataset). Numbers and caveats in `benchmarks/README.md`
 - [x] License: MIT OR Apache-2.0 (dual, as is common in Rust)
 
 ## Alternatives considered
