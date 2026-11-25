@@ -1,5 +1,6 @@
 """Tests for Arrow table input and output through the Arrow PyCapsule interface."""
 
+import sys
 from collections.abc import Sequence
 from datetime import date, datetime
 
@@ -7,7 +8,7 @@ import polars as pl
 import pyarrow as pa
 import pytest
 from hypothesis import given, settings
-from remitmatch import Invoice, MatchConfig, Payment, reconcile
+from remitmatch import Invoice, MatchConfig, Payment, ReconciliationResult, reconcile
 from test_properties import Inputs, inputs
 
 DAY = date(2024, 1, 10)
@@ -387,3 +388,142 @@ def test_tables_and_objects_give_equal_results(data: Inputs) -> None:
     invoices, payments, config = data
     from_tables = reconcile(invoice_table(invoices), payment_table(payments), config)
     assert from_tables == reconcile(invoices, payments, config)
+
+
+OUTPUT_SCHEMA = pa.schema(
+    [
+        ("match_index", pa.uint32()),
+        ("kind", pa.string()),
+        ("status", pa.string()),
+        ("payment_id", pa.string()),
+        ("invoice_id", pa.string()),
+        ("score", pa.float64()),
+        ("residual_minor", pa.int64()),
+        ("reference_score", pa.float64()),
+        ("amount_score", pa.float64()),
+        ("name_score", pa.float64()),
+        ("date_score", pa.float64()),
+    ]
+)
+
+
+def expected_rows(result: ReconciliationResult) -> list[dict[str, object]]:
+    """Compute the documented rows of to_arrow from the matches of a result.
+
+    Args:
+        result: The result to flatten.
+
+    Returns:
+        One row per payment-invoice pair, in match, payment and invoice order.
+    """
+    return [
+        {
+            "match_index": index,
+            "kind": match.kind.value,
+            "status": match.status.value,
+            "payment_id": payment_id,
+            "invoice_id": invoice_id,
+            "score": match.score,
+            "residual_minor": match.residual_minor,
+            "reference_score": match.breakdown["reference"],
+            "amount_score": match.breakdown["amount"],
+            "name_score": match.breakdown["name"],
+            "date_score": match.breakdown["date"],
+        }
+        for index, match in enumerate(result.matches)
+        for payment_id in match.payment_ids
+        for invoice_id in match.invoice_ids
+    ]
+
+
+def test_to_arrow_schema_and_group_rows() -> None:
+    """A 1:N match gives one row per invoice with the documented columns and types."""
+    table = EXPECTED.to_arrow()
+    assert isinstance(table, pa.Table)
+    assert table.schema.equals(OUTPUT_SCHEMA)
+    assert table.to_pylist() == expected_rows(EXPECTED)
+    assert [row["invoice_id"] for row in table.to_pylist()] == ["i1", "i2"]
+    assert {row["kind"] for row in table.to_pylist()} == {"1:N"}
+
+
+def test_to_arrow_one_to_one() -> None:
+    """A 1:1 match gives exactly one row."""
+    result = reconcile(INVOICES[:1], [Payment("p1", 6_000, "EUR", DAY, "INV-1", "ACME", "main")])
+    rows = result.to_arrow().to_pylist()
+    assert rows == expected_rows(result)
+    assert len(rows) == 1
+    assert rows[0]["kind"] == "1:1"
+    assert rows[0]["match_index"] == 0
+
+
+def test_to_arrow_many_to_one() -> None:
+    """An N:1 match gives one row per payment, with the residual repeated."""
+    result = reconcile(
+        [Invoice("i1", "INV-1", 10_000, "EUR", DAY, DAY, "Acme S.L.", "main")],
+        [
+            Payment("p1", 4_000, "EUR", DAY, "INV-1", "ACME", "main"),
+            Payment("p2", 6_000, "EUR", DAY, "INV-1", "ACME", "main"),
+        ],
+    )
+    rows = result.to_arrow().to_pylist()
+    assert rows == expected_rows(result)
+    assert [(row["payment_id"], row["invoice_id"]) for row in rows] == [("p1", "i1"), ("p2", "i1")]
+    assert {row["kind"] for row in rows} == {"N:1"}
+
+
+def test_to_arrow_orders_rows_by_match_then_payment_then_invoice() -> None:
+    """Several matches keep the order of matches, with match_index counting them."""
+    invoices = [
+        Invoice("i1", "INV-1", 10_000, "EUR", DAY, DAY, "Acme S.L.", "main"),
+        Invoice("i2", "INV-2", 5_000, "EUR", DAY, DAY, "Acme S.L.", "main"),
+        Invoice("i3", "INV-3", 3_000, "EUR", DAY, DAY, "Acme S.L.", "main"),
+    ]
+    payments = [
+        Payment("p1", 4_000, "EUR", DAY, "INV-1", "ACME", "main"),
+        Payment("p2", 6_000, "EUR", DAY, "INV-1", "ACME", "main"),
+        Payment("p3", 5_000, "EUR", DAY, "INV-2", "ACME", "main"),
+        Payment("p4", 3_000, "EUR", DAY, "INV-3", "ACME", "main"),
+    ]
+    result = reconcile(invoices, payments)
+    table = result.to_arrow()
+    assert len(result.matches) == 3
+    assert table.to_pylist() == expected_rows(result)
+    assert table.column("match_index").to_pylist() == sorted(
+        table.column("match_index").to_pylist()
+    )
+    assert set(table.column("match_index").to_pylist()) == {0, 1, 2}
+
+
+def test_to_arrow_excludes_unmatched_ids() -> None:
+    """Unmatched ids are not in the table."""
+    ids = set(EXPECTED.to_arrow().column("payment_id").to_pylist())
+    ids |= set(EXPECTED.to_arrow().column("invoice_id").to_pylist())
+    assert ids.isdisjoint({"p2", "i3"})
+
+
+def test_to_arrow_of_an_empty_result_keeps_the_schema() -> None:
+    """A result without matches gives an empty table with the same schema."""
+    table = ReconciliationResult([], [], []).to_arrow()
+    assert table.num_rows == 0
+    assert table.schema.equals(OUTPUT_SCHEMA)
+
+
+def test_to_arrow_output_is_readable_by_polars() -> None:
+    """The output table is a plain pyarrow Table that other libraries can read."""
+    assert pl.from_arrow(EXPECTED.to_arrow()).shape == (2, 11)
+
+
+def test_to_arrow_without_pyarrow_raises_import_error_naming_the_extra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When pyarrow cannot be imported, to_arrow raises ImportError that names the extra."""
+    monkeypatch.setitem(sys.modules, "pyarrow", None)
+    with pytest.raises(ImportError, match=r"remitmatch\[arrow\]"):
+        EXPECTED.to_arrow()
+
+
+def test_input_does_not_need_pyarrow_to_be_importable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Object input and the match data work without pyarrow."""
+    monkeypatch.setitem(sys.modules, "pyarrow", None)
+    result = reconcile(INVOICES, PAYMENTS)
+    assert len(result.matches) == 1

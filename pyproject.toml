@@ -21,6 +21,9 @@ classifiers = [
     "Typing :: Typed",
 ]
 
+[project.optional-dependencies]
+arrow = ["pyarrow>=14"]
+
 [project.urls]
 Repository = "https://github.com/eamigo86/remitmatch"
 RFC = "https://github.com/eamigo86/remitmatch/blob/main/docs/rfc/0001-remitmatch.md"

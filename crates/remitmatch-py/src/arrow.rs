@@ -1,4 +1,5 @@
-//! Arrow table input for `reconcile`, read through the Arrow PyCapsule interface.
+//! Arrow table input for `reconcile` and the Arrow table of a result, through the Arrow
+//! PyCapsule interface.
 //!
 //! Batches are pulled from the producer with the GIL held, because a producer may call back
 //! into Python while it exports. The conversion into core structs needs no Python object and
@@ -10,14 +11,18 @@ use arrow_array::types::{
     ArrowPrimitiveType, Date32Type, Date64Type, Int8Type, Int16Type, Int32Type, Int64Type,
     UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
-use arrow_array::{ArrayRef, RecordBatch, RecordBatchReader};
+use std::sync::Arc;
+
+use arrow_array::{
+    ArrayRef, Float64Array, Int64Array, RecordBatch, RecordBatchReader, StringArray, UInt32Array,
+};
 use arrow_schema::DataType;
 use chrono::NaiveDate;
 use pyo3::exceptions::{PyOverflowError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 use pyo3_arrow::PyRecordBatchReader;
-use remitmatch::{Invoice, Payment};
+use remitmatch::{Invoice, Match, Payment, ReconciliationResult};
 
 /// Milliseconds in one day, the unit of an Arrow `date64` value.
 const MILLIS_PER_DAY: i64 = 86_400_000;
@@ -249,4 +254,83 @@ fn dates(batch: &RecordBatch, name: &str) -> PyResult<Vec<NaiveDate>> {
             .collect(),
         other => Err(type_error(name, other)),
     }
+}
+
+/// Builds the output table: one row per payment-invoice pair of every match, in match order,
+/// then payment order, then invoice order.
+///
+/// A signal missing from a hand-built match breakdown is a null in its column.
+pub(crate) fn matches_batch(result: &ReconciliationResult) -> PyResult<RecordBatch> {
+    let pairs: Vec<(usize, &Match, &str, &str)> = result
+        .matches
+        .iter()
+        .enumerate()
+        .flat_map(|(index, m)| {
+            m.payment_ids.iter().flat_map(move |payment| {
+                m.invoice_ids
+                    .iter()
+                    .map(move |invoice| (index, m, payment.as_str(), invoice.as_str()))
+            })
+        })
+        .collect();
+    let indexes = pairs
+        .iter()
+        .map(|(index, ..)| u32::try_from(*index))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| PyOverflowError::new_err("too many matches for a uint32 match_index"))?;
+    let signal = |name: &str| -> ArrayRef {
+        Arc::new(Float64Array::from_iter(
+            pairs
+                .iter()
+                .map(|(_, m, ..)| m.breakdown.get(name).copied()),
+        ))
+    };
+    let columns: Vec<(&str, ArrayRef)> = vec![
+        ("match_index", Arc::new(UInt32Array::from(indexes))),
+        (
+            "kind",
+            Arc::new(StringArray::from_iter_values(
+                pairs.iter().map(|(_, m, ..)| crate::kind_value(m.kind)),
+            )),
+        ),
+        (
+            "status",
+            Arc::new(StringArray::from_iter_values(
+                pairs.iter().map(|(_, m, ..)| crate::status_value(m.status)),
+            )),
+        ),
+        (
+            "payment_id",
+            Arc::new(StringArray::from_iter_values(
+                pairs.iter().map(|(_, _, payment, _)| *payment),
+            )),
+        ),
+        (
+            "invoice_id",
+            Arc::new(StringArray::from_iter_values(
+                pairs.iter().map(|(_, _, _, invoice)| *invoice),
+            )),
+        ),
+        (
+            "score",
+            Arc::new(Float64Array::from_iter_values(
+                pairs.iter().map(|(_, m, ..)| m.score),
+            )),
+        ),
+        (
+            "residual_minor",
+            Arc::new(Int64Array::from_iter_values(
+                pairs.iter().map(|(_, m, ..)| m.residual_minor),
+            )),
+        ),
+        ("reference_score", signal("reference")),
+        ("amount_score", signal("amount")),
+        ("name_score", signal("name")),
+        ("date_score", signal("date")),
+    ];
+    // Every field is nullable, so the schema is the same for an empty and a full result.
+    RecordBatch::try_from_iter_with_nullable(
+        columns.into_iter().map(|(name, array)| (name, array, true)),
+    )
+    .map_err(|error| PyValueError::new_err(format!("cannot build the Arrow table: {error}")))
 }
