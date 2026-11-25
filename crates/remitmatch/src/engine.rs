@@ -11,7 +11,7 @@ use rayon::prelude::*;
 
 use crate::normalize::{Reference, normalize_name, normalize_reference};
 use crate::score::{
-    CharCounts, EPS, Signals, Weights, amount_signal, breakdown, date_signal,
+    EPS, LazyCounts, Signals, Weights, amount_signal, breakdown, date_signal,
     fuzzy_reference_signal_with, meets, name_signal, weighted_score,
 };
 use crate::subset::{GROUP_CANDIDATE_LIMIT, GROUP_SUBSET_LIMIT, find_subsets};
@@ -88,10 +88,9 @@ struct Engine<'a> {
     invoice_name: Vec<String>,
     payment_reference: Vec<Reference>,
     payment_name: Vec<String>,
-    /// Character counts of each normalized invoice number, for the fuzzy reference prefilter.
-    invoice_number_counts: Vec<CharCounts>,
-    /// Character counts of each normalized payment reference.
-    payment_reference_counts: Vec<CharCounts>,
+    /// Character counts of each normalized invoice number, built when the fuzzy reference
+    /// prefilter first needs them.
+    invoice_number_counts: Vec<LazyCounts>,
     /// Whether a candidate with no reference signal can neither be accepted nor make another
     /// candidate of its anchor ambiguous; see [`cannot_matter`].
     skip_unnamed: bool,
@@ -186,12 +185,9 @@ fn reconcile_validated(
         config,
         weights: Weights::from_map(&config.weights),
         tolerance: u64::try_from(config.amount_tolerance_minor).unwrap_or(0),
-        invoice_number_counts: map_rows(&invoice_number, parallel, |n| CharCounts::of(n)),
+        invoice_number_counts: (0..invoices.len()).map(|_| LazyCounts::default()).collect(),
         invoice_number,
         invoice_name: map_rows(invoices, parallel, |i| normalize_name(&i.counterparty)),
-        payment_reference_counts: map_rows(&payment_reference, parallel, |r| {
-            CharCounts::of(&r.text)
-        }),
         payment_reference,
         payment_name: map_rows(payments, parallel, |p| normalize_name(&p.counterparty)),
         skip_unnamed: cannot_matter(&Weights::from_map(&config.weights), config, 0.0),
@@ -655,6 +651,8 @@ impl Engine<'_> {
             return Vec::new();
         }
         let pay = &self.payments[payment];
+        // Shared by the invoices this payment is compared with; counted at most once.
+        let reference_counts = LazyCounts::default();
         let tolerance = self.config.amount_tolerance_minor;
         let low = pay.amount_minor.saturating_sub(tolerance);
         let high = pay.amount_minor.saturating_add(tolerance);
@@ -670,10 +668,7 @@ impl Engine<'_> {
                     fuzzy_reference_signal_with(
                         &self.invoice_number[i],
                         &self.payment_reference[payment].text,
-                        Some((
-                            &self.invoice_number_counts[i],
-                            &self.payment_reference_counts[payment],
-                        )),
+                        Some((&self.invoice_number_counts[i], &reference_counts)),
                     )
                 };
                 self.candidate(
