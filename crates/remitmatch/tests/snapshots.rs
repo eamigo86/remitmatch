@@ -66,6 +66,44 @@ enum Cfg {
     Win0,
     /// A date window of 5 days.
     Win5,
+    /// Reference-heavy weights.
+    RefHeavy,
+    /// Amount-heavy weights.
+    AmountHeavy,
+    /// Only the name signal counts.
+    NameOnly,
+    /// Only the date signal counts.
+    DateOnly,
+    /// A zero name weight.
+    NoName,
+    /// A zero date weight.
+    NoDate,
+    /// A zero amount weight.
+    NoAmount,
+    /// Weights that sum to 2.
+    Sum2,
+    /// A suggest threshold of 0.
+    Thr0,
+    /// A suggest threshold of 0.3.
+    Thr30,
+    /// A suggest threshold of 0.55.
+    Thr55,
+    /// Suggest and auto thresholds of 0.9.
+    Thr90,
+    /// Equal suggest and auto thresholds of 0.6.
+    AutoEqSuggest,
+    /// An ambiguity margin of 0.2.
+    Margin20,
+    /// An ambiguity margin larger than the suggest threshold.
+    MarginHuge,
+}
+
+/// Returns the default configuration with the given weights.
+fn weighted(entries: &[(&str, f64)]) -> MatchConfig {
+    MatchConfig {
+        weights: entries.iter().map(|&(k, v)| (k.to_owned(), v)).collect(),
+        ..MatchConfig::default()
+    }
 }
 
 impl Cfg {
@@ -81,6 +119,21 @@ impl Cfg {
             Self::Margin0 => "margin0",
             Self::Win0 => "win0",
             Self::Win5 => "win5",
+            Self::RefHeavy => "refheavy",
+            Self::AmountHeavy => "amountheavy",
+            Self::NameOnly => "nameonly",
+            Self::DateOnly => "dateonly",
+            Self::NoName => "noname",
+            Self::NoDate => "nodate",
+            Self::NoAmount => "noamount",
+            Self::Sum2 => "sum2",
+            Self::Thr0 => "thr0",
+            Self::Thr30 => "thr30",
+            Self::Thr55 => "thr55",
+            Self::Thr90 => "thr90",
+            Self::AutoEqSuggest => "autoeq",
+            Self::Margin20 => "margin20",
+            Self::MarginHuge => "marginhuge",
         }
     }
 
@@ -126,11 +179,68 @@ impl Cfg {
                 date_window_days: 5,
                 ..base
             },
+            Self::RefHeavy => weighted(&[
+                ("reference", 0.7),
+                ("amount", 0.1),
+                ("name", 0.1),
+                ("date", 0.1),
+            ]),
+            Self::AmountHeavy => weighted(&[
+                ("reference", 0.1),
+                ("amount", 0.7),
+                ("name", 0.1),
+                ("date", 0.1),
+            ]),
+            Self::NameOnly => weighted(&[("name", 1.0)]),
+            Self::DateOnly => weighted(&[("date", 1.0)]),
+            Self::NoName => weighted(&[("reference", 0.5), ("amount", 0.3), ("date", 0.2)]),
+            Self::NoDate => weighted(&[("reference", 0.5), ("amount", 0.3), ("name", 0.2)]),
+            Self::NoAmount => weighted(&[("reference", 0.5), ("name", 0.3), ("date", 0.2)]),
+            Self::Sum2 => weighted(&[
+                ("reference", 0.9),
+                ("amount", 0.6),
+                ("name", 0.3),
+                ("date", 0.2),
+            ]),
+            Self::Thr0 => MatchConfig {
+                suggest_threshold: 0.0,
+                ..base
+            },
+            Self::Thr30 => MatchConfig {
+                suggest_threshold: 0.3,
+                ..base
+            },
+            Self::Thr55 => MatchConfig {
+                suggest_threshold: 0.55,
+                ..base
+            },
+            Self::Thr90 => MatchConfig {
+                suggest_threshold: 0.9,
+                auto_threshold: 0.9,
+                ..base
+            },
+            Self::AutoEqSuggest => MatchConfig {
+                suggest_threshold: 0.6,
+                auto_threshold: 0.6,
+                ..base
+            },
+            Self::Margin20 => MatchConfig {
+                ambiguity_margin: 0.2,
+                ..base
+            },
+            Self::MarginHuge => MatchConfig {
+                ambiguity_margin: 1.5,
+                ..base
+            },
         }
     }
 }
 
-use Cfg::{BigTol, Default as Dflt, Group0, Group2, Margin0, NoRef, Tol300, Win0, Win5};
+use Cfg::{
+    AmountHeavy, AutoEqSuggest, BigTol, DateOnly, Default as Dflt, Group0, Group2, Margin0,
+    Margin20, MarginHuge, NameOnly, NoAmount, NoDate, NoName, NoRef, RefHeavy, Sum2, Thr0, Thr30,
+    Thr55, Thr90, Tol300, Win0, Win5,
+};
 use Data::{Clean, Dense, Realistic};
 
 /// The cases: dataset, configuration and the expected hash of the canonical dump.
@@ -195,6 +305,34 @@ const CASES: &[(Data, Cfg, u64)] = &[
     (Dense(5, 2000), Dflt, 0x3558dad0e8dd95f1),
     (Dense(5, 2000), Win5, 0xd749b6119f71e407),
     (Dense(5, 2000), Win0, 0x03c5cd887f5cf058),
+    (Dense(2, 150), RefHeavy, 0x55e7420dfd7e520e),
+    (Dense(2, 150), AmountHeavy, 0x49e242d6afcfcec1),
+    (Dense(2, 150), NameOnly, 0x92195bbf6843589a),
+    (Dense(2, 150), DateOnly, 0xfd81cde7c6f053b5),
+    (Dense(2, 150), NoName, 0x3eff792beb667c99),
+    (Dense(2, 150), NoDate, 0x6312c83968a2c7b5),
+    (Dense(2, 150), NoAmount, 0x4afccf7052a139d3),
+    (Dense(2, 150), Sum2, 0x5ab6b4ba9ccab29a),
+    (Dense(3, 400), Thr0, 0xe9e3cc0a3d443eef),
+    (Dense(3, 400), Thr30, 0xe9e3cc0a3d443eef),
+    (Dense(3, 400), Thr55, 0x699dea9cebf31861),
+    (Dense(3, 400), Thr90, 0x8047d9ac73444200),
+    (Dense(3, 400), AutoEqSuggest, 0xb2e70b233e43e522),
+    (Dense(3, 400), Margin20, 0xf1e98cf95da616c6),
+    (Dense(3, 400), MarginHuge, 0xae473809f403c1de),
+    (Realistic(2, 200), AmountHeavy, 0x9146d4101ffdb56c),
+    (Realistic(2, 200), NoName, 0xade6d3e4314ce061),
+    (Realistic(2, 200), Thr30, 0x4aad6982dce0087d),
+    (Realistic(2, 200), Thr55, 0x8b9a46a1776f972f),
+    (Realistic(2, 200), AutoEqSuggest, 0x30e8e73d3e1e3615),
+    (Realistic(2, 200), MarginHuge, 0xc6d89f8e3b3c682d),
+    (Realistic(3, 600), RefHeavy, 0x49186eb5abd6a652),
+    (Realistic(3, 600), Thr0, 0xf1ccbb9efe9884f5),
+    (Realistic(3, 600), Margin20, 0x4a819c45b1c4b124),
+    (Dense(1, 50), Thr0, 0x11577515205848d0),
+    (Dense(1, 50), Thr90, 0x045c042921e5a462),
+    (Dense(1, 50), MarginHuge, 0x736c0dfe1a9e6d55),
+    (Dense(1, 50), Sum2, 0xc99e970513a6c1b6),
 ];
 
 /// Hashes the bytes with 64-bit FNV-1a.

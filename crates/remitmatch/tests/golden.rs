@@ -1076,3 +1076,205 @@ fn a_truncated_mention_pool_is_never_auto() {
     assert_eq!(r.matches.len(), 1);
     assert_eq!(r.matches[0].status, MatchStatus::Auto);
 }
+
+// Ambiguity and the suggest threshold. The ambiguity of an anchor looks at every candidate of
+// its pass, including those below the suggest threshold. The tests below use weights with
+// only `amount`, so a candidate scores exactly its amount signal (1 minus the difference
+// over a tolerance of 100), and a margin of 0.3 against a threshold of 0.9.
+
+fn amount_only_config() -> MatchConfig {
+    MatchConfig {
+        amount_tolerance_minor: 100,
+        weights: weights(&[("amount", 1.0)]),
+        suggest_threshold: 0.9,
+        auto_threshold: 0.95,
+        ambiguity_margin: 0.3,
+        ..MatchConfig::default()
+    }
+}
+
+/// Matches a payment of 10,000 against an exact invoice and one that is off by `off`.
+fn one_to_one_with_a_rival(off: i64) -> ReconciliationResult {
+    run(
+        &[inv("i1", "INV-1", 10_000), inv("i2", "INV-2", 10_000 + off)],
+        &[pay("p1", 10_000, "thanks")],
+        &amount_only_config(),
+    )
+}
+
+#[test]
+fn a_one_to_one_rival_below_the_threshold_but_inside_the_margin_makes_the_match_ambiguous() {
+    // The rival scores 0.8: below the threshold of 0.9, 0.2 under the accepted 1.0.
+    let r = one_to_one_with_a_rival(20);
+    assert_eq!(r.matches.len(), 1);
+    assert_eq!(r.matches[0].invoice_ids, vec!["i1"]);
+    assert_eq!(r.matches[0].status, MatchStatus::Ambiguous);
+    assert_eq!(r.unmatched_invoices, vec!["i2"]);
+}
+
+#[test]
+fn a_one_to_one_rival_below_the_threshold_and_outside_the_margin_is_ignored() {
+    // The rival scores 0.5, 0.5 under the accepted 1.0.
+    let r = one_to_one_with_a_rival(50);
+    assert_eq!(r.matches.len(), 1);
+    assert_eq!(r.matches[0].status, MatchStatus::Auto);
+}
+
+/// Matches a payment of 10,000 against groups of invoices: one exact, one off by `off`.
+fn one_to_many_with_a_rival(off: i64) -> ReconciliationResult {
+    run(
+        &[
+            inv("i1", "INV-1", 6_000),
+            inv("i2", "INV-2", 4_000),
+            inv("i3", "INV-3", 5_000),
+            inv("i4", "INV-4", 5_000 + off),
+        ],
+        &[pay("p1", 10_000, "thanks")],
+        &amount_only_config(),
+    )
+}
+
+#[test]
+fn a_one_to_many_rival_group_below_the_threshold_inside_the_margin_is_ambiguous() {
+    let r = one_to_many_with_a_rival(20);
+    assert_eq!(r.matches.len(), 1);
+    assert_eq!(r.matches[0].kind, MatchKind::OneToMany);
+    assert_eq!(r.matches[0].invoice_ids, vec!["i1", "i2"]);
+    assert_eq!(r.matches[0].status, MatchStatus::Ambiguous);
+}
+
+#[test]
+fn a_one_to_many_rival_group_below_the_threshold_outside_the_margin_is_still_ambiguous() {
+    // More than one fitting group is ambiguous by itself, whatever the scores.
+    let r = one_to_many_with_a_rival(80);
+    assert_eq!(r.matches.len(), 1);
+    assert_eq!(r.matches[0].invoice_ids, vec!["i1", "i2"]);
+    assert_eq!(r.matches[0].status, MatchStatus::Ambiguous);
+}
+
+/// Matches an invoice of 10,000 against groups of payments: one exact, one off by `off`.
+fn many_to_one_with_a_rival(off: i64) -> ReconciliationResult {
+    run(
+        &[inv("i1", "INV-1", 10_000)],
+        &[
+            pay("p1", 6_000, "thanks"),
+            pay("p2", 4_000, "thanks"),
+            pay("p3", 5_000, "thanks"),
+            pay("p4", 5_000 + off, "thanks"),
+        ],
+        &amount_only_config(),
+    )
+}
+
+#[test]
+fn a_many_to_one_rival_group_below_the_threshold_inside_the_margin_is_ambiguous() {
+    let r = many_to_one_with_a_rival(20);
+    assert_eq!(r.matches.len(), 1);
+    assert_eq!(r.matches[0].kind, MatchKind::ManyToOne);
+    assert_eq!(r.matches[0].payment_ids, vec!["p1", "p2"]);
+    assert_eq!(r.matches[0].status, MatchStatus::Ambiguous);
+}
+
+#[test]
+fn a_many_to_one_rival_group_below_the_threshold_outside_the_margin_is_still_ambiguous() {
+    let r = many_to_one_with_a_rival(80);
+    assert_eq!(r.matches.len(), 1);
+    assert_eq!(r.matches[0].payment_ids, vec!["p1", "p2"]);
+    assert_eq!(r.matches[0].status, MatchStatus::Ambiguous);
+}
+
+#[test]
+fn a_single_group_below_the_threshold_leaves_the_accepted_group_unambiguous() {
+    // The only fitting group scores 1.0; the rest of the pool does not add up.
+    let r = run(
+        &[inv("i1", "INV-1", 6_000), inv("i2", "INV-2", 4_000)],
+        &[pay("p1", 10_000, "thanks")],
+        &amount_only_config(),
+    );
+    assert_eq!(r.matches.len(), 1);
+    assert_eq!(r.matches[0].status, MatchStatus::Auto);
+}
+
+#[test]
+fn a_rival_exactly_the_margin_below_the_accepted_score_is_not_ambiguous() {
+    // Default weights, threshold 0.55: the accepted candidate has no reference signal and
+    // scores 0.55 (the default weights without `reference`). The rival is 4 days off its due
+    // date inside a window of 5 days, so its date signal is 0.5 and it scores 0.05 less:
+    // exactly the margin of 0.05, which the epsilon of the comparison reads as not ambiguous.
+    let config = MatchConfig {
+        suggest_threshold: 0.55,
+        date_window_days: 5,
+        ..MatchConfig::default()
+    };
+    let rival = Invoice {
+        due_date: day(14),
+        ..inv("i2", "INV-2", 10_000)
+    };
+    let r = run(
+        &[inv("i1", "INV-1", 10_000), rival],
+        &[pay("p1", 10_000, "thanks")],
+        &config,
+    );
+    assert_eq!(r.matches.len(), 1);
+    assert_eq!(r.matches[0].invoice_ids, vec!["i1"]);
+    assert_eq!(r.matches[0].status, MatchStatus::Suggested);
+}
+
+#[test]
+fn a_rival_just_inside_the_margin_below_the_accepted_score_is_ambiguous() {
+    // As above with a date window of 6 days: the rival's date signal is 1 - 1/3, so it
+    // scores about 0.033 less than the accepted candidate, inside the margin of 0.05.
+    let config = MatchConfig {
+        suggest_threshold: 0.55,
+        date_window_days: 6,
+        ..MatchConfig::default()
+    };
+    let rival = Invoice {
+        due_date: day(14),
+        ..inv("i2", "INV-2", 10_000)
+    };
+    let r = run(
+        &[inv("i1", "INV-1", 10_000), rival],
+        &[pay("p1", 10_000, "thanks")],
+        &config,
+    );
+    assert_eq!(r.matches[0].status, MatchStatus::Ambiguous);
+}
+
+#[test]
+fn a_candidate_without_reference_sits_at_the_pruning_bound_under_the_defaults() {
+    // Under the default weights a candidate with no reference signal scores at most 0.55,
+    // which is the suggest threshold (0.60) minus the margin (0.05): it cannot be accepted
+    // and, for an anchor with an accepted candidate, it is not a close rival either. Here the
+    // rival is a perfect candidate without a reference (0.55) next to a fuzzy-reference
+    // candidate that scores well above it.
+    let r = run(
+        &[
+            inv("i1", "INV-20240001", 10_000),
+            inv("i2", "OTHER-9", 10_000),
+        ],
+        &[pay("p1", 10_000, "PAGO INV-20240011")],
+        &MatchConfig::default(),
+    );
+    assert_eq!(r.matches.len(), 1);
+    assert_eq!(r.matches[0].invoice_ids, vec!["i1"]);
+    assert_eq!(r.matches[0].status, MatchStatus::Auto);
+    assert_eq!(r.unmatched_invoices, vec!["i2"]);
+}
+
+#[test]
+fn a_payment_naming_an_invoice_that_does_not_fit_still_matches_an_unnamed_one() {
+    // p1 names i1, whose amount is far off, so the payment is explained and its other
+    // candidates get no fuzzy reference signal; with weights where the unnamed invoice can
+    // still score, it is matched.
+    let r = run(
+        &[inv("i1", "INV-1", 99_999), inv("i2", "INV-2", 10_000)],
+        &[pay("p1", 10_000, "INV-1")],
+        &no_reference_config(),
+    );
+    assert_eq!(r.matches.len(), 1);
+    assert_eq!(r.matches[0].invoice_ids, vec!["i2"]);
+    assert_eq!(r.matches[0].status, MatchStatus::Auto);
+    assert!(close(r.matches[0].breakdown["reference"], 0.0));
+    assert_eq!(r.unmatched_invoices, vec!["i1"]);
+}
