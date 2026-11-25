@@ -2,6 +2,7 @@
 
 import datetime
 import re
+from collections.abc import Callable
 
 import pytest
 
@@ -9,6 +10,13 @@ pytest.importorskip("pandas")
 pytest.importorskip("rapidfuzz")
 
 import generate  # noqa: E402
+from baselines import pandas_rapidfuzz, pure_python  # noqa: E402
+
+BASELINES = [
+    pytest.param(pure_python.match, id="pure-python"),
+    pytest.param(pandas_rapidfuzz.match, id="pandas-rapidfuzz"),
+]
+Matcher = Callable[[list[generate.Invoice], list[generate.Payment], int], list[generate.Group]]
 
 
 def _covered(data: generate.Dataset) -> tuple[set[str], set[str]]:
@@ -203,3 +211,109 @@ def test_evaluate_handles_an_empty_answer() -> None:
     assert accuracy.proposed == 0
     assert accuracy.precision == 1.0
     assert accuracy.recall == 0.0
+
+
+def _hand_made() -> tuple[list[generate.Invoice], list[generate.Payment]]:
+    """Build a few rows that exercise the matching rules one by one.
+
+    Returns:
+        Four invoices and six payments with known outcomes.
+    """
+    due = datetime.date(2024, 3, 31)
+
+    def invoice(k: int, amount: int, currency: str = "EUR", scope: str = "s") -> generate.Invoice:
+        return generate.Invoice(
+            f"i{k}", f"INV-2024-{k:07d}", amount, currency, due - datetime.timedelta(30), due,
+            "Acme Trading S.L.", scope,
+        )  # fmt: skip
+
+    def payment(
+        k: int, amount: int, ref: str, currency: str = "EUR", scope: str = "s", day: int = 0
+    ) -> generate.Payment:
+        return generate.Payment(
+            f"p{k}", amount, currency, due + datetime.timedelta(day), ref, "ACME TRADING", scope
+        )
+
+    invoices = [invoice(1, 100_000), invoice(2, 200_000), invoice(3, 300_000), invoice(4, 400_000)]
+    payments = [
+        payment(1, 100_000, "Payment INV-2024-0000001"),  # exact
+        payment(2, 199_700, "fact inv 2024 0000002 gracias"),  # short by 300, inside tolerance
+        payment(3, 299_699, "Payment INV-2024-0000003"),  # short by 301, outside tolerance
+        payment(4, 400_000, "Payment INV-2024-0000004", currency="USD"),  # other currency
+        payment(5, 400_000, "Payment INV-2024-0000004", scope="other"),  # other scope
+        payment(6, 300_000, "Payment INV-2024-000003", day=5),  # one digit dropped, same amount
+    ]
+    return invoices, payments
+
+
+@pytest.mark.parametrize("match", BASELINES)
+def test_baseline_follows_the_matching_rules(match: Matcher) -> None:
+    """Tolerance, currency and scope are respected and a misspelled number still matches.
+
+    Args:
+        match: Baseline under test.
+    """
+    invoices, payments = _hand_made()
+    found = {(tuple(p), tuple(i)) for p, i in match(invoices, payments, 300)}
+    assert found == {
+        (("p1",), ("i1",)),
+        (("p2",), ("i2",)),
+        (("p6",), ("i3",)),
+    }
+
+
+@pytest.mark.parametrize("match", BASELINES)
+def test_baseline_matches_everything_on_noise_free_data(match: Matcher) -> None:
+    """Without noise every payment is matched to its invoice, and nothing else.
+
+    Args:
+        match: Baseline under test.
+    """
+    data = generate.generate(2_000, generate.CLEAN, seed=1)
+    accuracy = generate.evaluate(match(data.invoices, data.payments, 300), data.solution)
+    assert accuracy.proposed == len(data.solution)
+    assert accuracy.precision == 1.0
+    assert accuracy.recall == 1.0
+
+
+@pytest.mark.parametrize("match", BASELINES)
+def test_baseline_is_precise_on_noisy_data(match: Matcher) -> None:
+    """On realistic one-to-one noise the proposed matches are almost all right.
+
+    Precision is held above 0.97: the only way to be wrong is a misspelled number that lands on
+    another invoice of similar amount. Recall is held above 0.80: payments without an invoice
+    number (5 percent) cannot be matched by reference, and the rest depend on the fuzzy pass.
+
+    Args:
+        match: Baseline under test.
+    """
+    data = generate.generate(5_000, generate.ONE_TO_ONE, seed=7)
+    accuracy = generate.evaluate(match(data.invoices, data.payments, 300), data.solution)
+    print(f"{match.__module__}: precision {accuracy.precision:.4f} recall {accuracy.recall:.4f}")
+    assert accuracy.precision >= 0.97
+    assert accuracy.recall >= 0.80
+
+
+@pytest.mark.parametrize("match", BASELINES)
+def test_baseline_uses_no_id_twice_and_is_deterministic(match: Matcher) -> None:
+    """Every id appears in at most one group and a second run gives the same answer.
+
+    Args:
+        match: Baseline under test.
+    """
+    data = generate.generate(3_000, generate.ONE_TO_ONE, seed=8)
+    first = match(data.invoices, data.payments, 300)
+    payments = [pid for p, _ in first for pid in p]
+    invoices = [iid for _, i in first for iid in i]
+    assert len(set(payments)) == len(payments)
+    assert len(set(invoices)) == len(invoices)
+    assert all(len(p) == 1 and len(i) == 1 for p, i in first)
+    assert match(data.invoices, data.payments, 300) == first
+
+
+def test_the_two_baselines_agree() -> None:
+    """Both baselines implement the same rules, so they find almost the same matches."""
+    data = generate.generate(5_000, generate.ONE_TO_ONE, seed=9)
+    a = {(tuple(p), tuple(i)) for p, i in pure_python.match(data.invoices, data.payments, 300)}
+    b = {(tuple(p), tuple(i)) for p, i in pandas_rapidfuzz.match(data.invoices, data.payments, 300)}
+    assert len(a & b) / len(a | b) >= 0.97
