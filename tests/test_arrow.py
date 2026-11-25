@@ -2,12 +2,13 @@
 
 import sys
 from collections.abc import Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import polars as pl
 import pyarrow as pa
 import pytest
 from hypothesis import given, settings
+from hypothesis import strategies as st
 from remitmatch import Invoice, MatchConfig, Payment, ReconciliationResult, reconcile
 from test_properties import Inputs, inputs
 
@@ -265,7 +266,10 @@ def test_wrong_type_is_detected_on_an_empty_table() -> None:
         reconcile(table, payment_table(PAYMENTS))
 
 
-@pytest.mark.parametrize("column", ["id", "amount_minor", "currency", "due_date", "counterparty"])
+@pytest.mark.parametrize(
+    "column",
+    ["id", "number", "amount_minor", "currency", "issue_date", "due_date", "counterparty"],
+)
 def test_missing_required_invoice_column_raises_value_error(column: str) -> None:
     """A missing required column raises ValueError naming it."""
     table = invoice_table(INVOICES).drop_columns(column)
@@ -273,7 +277,10 @@ def test_missing_required_invoice_column_raises_value_error(column: str) -> None
         reconcile(table, payment_table(PAYMENTS))
 
 
-@pytest.mark.parametrize("column", ["id", "amount_minor", "currency", "value_date", "reference"])
+@pytest.mark.parametrize(
+    "column",
+    ["id", "amount_minor", "currency", "value_date", "reference", "counterparty"],
+)
 def test_missing_required_payment_column_raises_value_error(column: str) -> None:
     """A missing required payment column raises ValueError naming it."""
     table = payment_table(PAYMENTS).drop_columns(column)
@@ -377,17 +384,129 @@ def test_repeated_ids_in_a_table_raise_value_error() -> None:
         reconcile(twice, payment_table(PAYMENTS))
 
 
+def misaligned(table: pa.Table, chunk: int) -> pa.Table:
+    """Split every column into chunks, with different chunk boundaries per column.
+
+    Args:
+        table: Table to re-chunk.
+        chunk: Base chunk length; column number k uses chunk plus k, so no two neighbouring
+            columns share their chunk boundaries.
+
+    Returns:
+        A table with the same rows whose columns are chunked arrays with misaligned chunks.
+    """
+    columns = {}
+    for position, name in enumerate(table.column_names):
+        column = table.column(name)
+        size = max(chunk + position, 1)
+        parts = [column.slice(start, size) for start in range(0, len(column), size)]
+        columns[name] = pa.chunked_array(parts, type=column.type)
+    return pa.table(columns)
+
+
+def many_rows(count: int) -> tuple[list[Invoice], list[Payment]]:
+    """Build invoices and the payments that settle them one to one.
+
+    Args:
+        count: Number of invoices and of payments.
+
+    Returns:
+        Invoices and payments whose ids are in the same order and that match pairwise.
+    """
+    invoices = [
+        Invoice(
+            f"i{k}", f"INV-{k}", 1_000 + k, "EUR", DAY, DAY + timedelta(days=k), "Acme S.L.", "main"
+        )
+        for k in range(count)
+    ]
+    payments = [
+        Payment(f"p{k}", 1_000 + k, "EUR", DAY + timedelta(days=k), f"INV-{k}", "ACME", "main")
+        for k in range(count)
+    ]
+    return invoices, payments
+
+
+def test_sliced_tables_with_offsets_equal_objects() -> None:
+    """A slice that starts inside the table reads only its own rows."""
+    invoices, payments = many_rows(10)
+    result = reconcile(invoice_table(invoices).slice(3, 5), payment_table(payments).slice(3, 5))
+    assert result == reconcile(invoices[3:8], payments[3:8])
+    assert len(result.matches) == 5
+
+
+def test_empty_slice_of_a_table_is_an_empty_table() -> None:
+    """A slice of length zero gives an empty result, not the rows after the offset."""
+    invoices, payments = many_rows(10)
+    result = reconcile(invoice_table(invoices).slice(4, 0), payment_table(payments).slice(4, 0))
+    assert result == reconcile([], [])
+
+
+def test_slice_of_a_multi_chunk_table() -> None:
+    """A slice that spans several chunks and starts inside one reads the right rows."""
+    invoices, payments = many_rows(10)
+    chunked_invoices = pa.Table.from_batches(invoice_table(invoices).to_batches(max_chunksize=3))
+    chunked_payments = pa.Table.from_batches(payment_table(payments).to_batches(max_chunksize=4))
+    assert chunked_invoices.column("id").num_chunks > 1
+    result = reconcile(chunked_invoices.slice(2, 6), chunked_payments.slice(5, 4))
+    assert result == reconcile(invoices[2:8], payments[5:9])
+
+
+def test_columns_with_different_chunk_boundaries() -> None:
+    """Columns chunked differently still line up row by row."""
+    invoices, payments = many_rows(10)
+    shifted_invoices = misaligned(invoice_table(invoices), 3)
+    shifted_payments = misaligned(payment_table(payments), 2)
+    assert shifted_invoices.column("id").num_chunks != shifted_invoices.column("number").num_chunks
+    assert reconcile(shifted_invoices, shifted_payments) == reconcile(invoices, payments)
+    assert reconcile(shifted_invoices.slice(1, 7), shifted_payments.slice(2, 7)) == reconcile(
+        invoices[1:8], payments[2:9]
+    )
+
+
+Layout = tuple[int, int, int]
+layouts = st.tuples(st.integers(1, 4), st.integers(0, 9), st.integers(0, 9))
+
+
+def laid_out(table: pa.Table, layout: Layout) -> pa.Table:
+    """Apply a drawn chunking and a drawn slice to a table.
+
+    Args:
+        table: Table to transform.
+        layout: Base chunk length, slice offset and slice length.
+
+    Returns:
+        The table with misaligned chunks, then sliced.
+    """
+    chunk, offset, length = layout
+    return misaligned(table, chunk).slice(offset, length)
+
+
 @settings(max_examples=100, deadline=None, database=None)
-@given(inputs())
-def test_tables_and_objects_give_equal_results(data: Inputs) -> None:
-    """For generated rows, reconcile on tables equals reconcile on objects.
+@given(inputs(), layouts, layouts)
+def test_tables_and_objects_give_equal_results(
+    data: Inputs, invoice_layout: Layout, payment_layout: Layout
+) -> None:
+    """For generated rows with a random chunking and slice, tables equal objects.
 
     Args:
         data: Drawn invoices, payments and configuration.
+        invoice_layout: Chunk length, slice offset and slice length for the invoice table.
+        payment_layout: Chunk length, slice offset and slice length for the payment table.
     """
     invoices, payments, config = data
-    from_tables = reconcile(invoice_table(invoices), payment_table(payments), config)
-    assert from_tables == reconcile(invoices, payments, config)
+    _, invoice_offset, invoice_length = invoice_layout
+    _, payment_offset, payment_length = payment_layout
+    from_tables = reconcile(
+        laid_out(invoice_table(invoices), invoice_layout),
+        laid_out(payment_table(payments), payment_layout),
+        config,
+    )
+    expected = reconcile(
+        invoices[invoice_offset : invoice_offset + invoice_length],
+        payments[payment_offset : payment_offset + payment_length],
+        config,
+    )
+    assert from_tables == expected
 
 
 OUTPUT_SCHEMA = pa.schema(
