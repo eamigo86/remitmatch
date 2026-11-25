@@ -19,6 +19,11 @@ doctest = false
 remitmatch = { path = "../remitmatch" }
 pyo3 = { version = "0.30.1", features = ["abi3-py310", "chrono"] }
 chrono = { version = "0.4.45", default-features = false }
+# Arrow input through the PyCapsule interface; the default buffer_protocol feature is off.
+pyo3-arrow = { version = "0.21", default-features = false }
+arrow-array = "60.1"
+arrow-cast = "60.1"
+arrow-schema = "60.1"
 
 [lints]
 workspace = true

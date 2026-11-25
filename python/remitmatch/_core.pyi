@@ -2,7 +2,7 @@
 
 from collections.abc import Sequence
 from datetime import date
-from typing import final
+from typing import Protocol, final
 
 import pyarrow
 
@@ -18,6 +18,9 @@ __all__ = [
     "version",
 ]
 
+class _ArrowStream(Protocol):
+    def __arrow_c_stream__(self, requested_schema: object | None = None) -> object: ...
+
 def version() -> str:
     """Return the version of the native core.
 
@@ -26,8 +29,8 @@ def version() -> str:
     """
 
 def reconcile(
-    invoices: Sequence[Invoice],
-    payments: Sequence[Payment],
+    invoices: Sequence[Invoice] | _ArrowStream,
+    payments: Sequence[Payment] | _ArrowStream,
     config: MatchConfig | None = None,
 ) -> ReconciliationResult:
     """Match payments against open invoices.
@@ -35,20 +38,33 @@ def reconcile(
     Runs in Rust and releases the GIL. Each invoice and payment appears in at most one
     match. The inputs are copied before matching starts.
 
+    Each of invoices and payments is either a sequence of objects or an Arrow table: any
+    object that exports the Arrow C stream, such as a pyarrow Table or RecordBatchReader or
+    a Polars DataFrame. The two arguments are independent. Table columns are matched by name
+    and extra columns are ignored. Invoices need id, number, amount_minor, currency,
+    issue_date, due_date and counterparty; payments need id, amount_minor, currency,
+    value_date, reference and counterparty; both accept an optional scope column, and a
+    missing one means the default scope. Text columns may be any Arrow string type or a
+    dictionary of strings, amount_minor any integer type that fits a signed 64-bit integer,
+    and dates date32 or date64. Floats, decimals and timestamps are rejected.
+
     Args:
-        invoices: Open invoices to settle, as a sequence such as a list or tuple. Any
-            sequence except a string is accepted.
-        payments: Bank movements received, as a sequence such as a list or tuple. Any
-            sequence except a string is accepted.
+        invoices: Open invoices to settle, as a sequence such as a list or tuple (any
+            sequence except a string) or as an Arrow table.
+        payments: Bank movements received, as a sequence such as a list or tuple (any
+            sequence except a string) or as an Arrow table.
         config: Tolerances and thresholds; defaults to MatchConfig().
 
     Returns:
         Matches with per-signal breakdown, plus unmatched ids on each side.
 
     Raises:
-        ValueError: An id repeats on one side, the config is invalid, or the reference index
-            cannot be built.
-        TypeError: An input is not a sequence of the expected objects.
+        ValueError: An id repeats on one side, the config is invalid, the reference index
+            cannot be built, a table lacks a required column or has a null or an invalid
+            date in a used column, or the Arrow stream cannot be read.
+        TypeError: An input is neither a sequence of the expected objects nor an Arrow
+            stream, or a table column has an unsupported Arrow type.
+        OverflowError: An integer value in a table does not fit a signed 64-bit integer.
     """
 
 @final

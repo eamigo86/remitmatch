@@ -1,0 +1,252 @@
+//! Arrow table input for `reconcile`, read through the Arrow PyCapsule interface.
+//!
+//! Batches are pulled from the producer with the GIL held, because a producer may call back
+//! into Python while it exports. The conversion into core structs needs no Python object and
+//! runs with the GIL released. Every failure is a Python exception that names the column;
+//! nothing here panics on caller data.
+
+use arrow_array::cast::AsArray;
+use arrow_array::types::{
+    ArrowPrimitiveType, Date32Type, Date64Type, Int8Type, Int16Type, Int32Type, Int64Type,
+    UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+};
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchReader};
+use arrow_schema::DataType;
+use chrono::NaiveDate;
+use pyo3::exceptions::{PyOverflowError, PyTypeError, PyValueError};
+use pyo3::prelude::*;
+use pyo3::types::PyCapsule;
+use pyo3_arrow::PyRecordBatchReader;
+use remitmatch::{Invoice, Payment};
+
+/// Milliseconds in one day, the unit of an Arrow `date64` value.
+const MILLIS_PER_DAY: i64 = 86_400_000;
+/// Scope of rows that come from a table without a `scope` column.
+const DEFAULT_SCOPE: &str = "default";
+
+/// Reads the Arrow C stream of `obj`, or returns `None` when `obj` does not export one.
+///
+/// An empty stream yields one empty batch, so the column checks also run on the schema.
+pub(crate) fn read_stream(obj: &Bound<'_, PyAny>) -> PyResult<Option<Vec<RecordBatch>>> {
+    if !obj.hasattr("__arrow_c_stream__")? {
+        return Ok(None);
+    }
+    let capsule = obj
+        .call_method0("__arrow_c_stream__")?
+        .cast_into::<PyCapsule>()?;
+    let reader = PyRecordBatchReader::from_arrow_pycapsule(&capsule)?.into_reader()?;
+    let schema = reader.schema();
+    let mut batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| PyValueError::new_err(format!("cannot read the Arrow stream: {error}")))?;
+    if batches.is_empty() {
+        batches.push(RecordBatch::new_empty(schema));
+    }
+    Ok(Some(batches))
+}
+
+/// Converts the batches of an invoice table into core invoices.
+pub(crate) fn invoices(batches: &[RecordBatch]) -> PyResult<Vec<Invoice>> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = text(batch, "id")?;
+        let numbers = text(batch, "number")?;
+        let amounts = ints(batch, "amount_minor")?;
+        let currencies = text(batch, "currency")?;
+        let issue_dates = dates(batch, "issue_date")?;
+        let due_dates = dates(batch, "due_date")?;
+        let counterparties = text(batch, "counterparty")?;
+        let scopes = scopes(batch)?;
+        rows.extend(
+            ids.into_iter()
+                .zip(numbers)
+                .zip(amounts)
+                .zip(currencies)
+                .zip(issue_dates)
+                .zip(due_dates)
+                .zip(counterparties)
+                .zip(scopes)
+                .map(
+                    |(
+                        (
+                            (((((id, number), amount_minor), currency), issue_date), due_date),
+                            counterparty,
+                        ),
+                        scope,
+                    )| {
+                        Invoice {
+                            id,
+                            number,
+                            amount_minor,
+                            currency,
+                            issue_date,
+                            due_date,
+                            counterparty,
+                            scope,
+                        }
+                    },
+                ),
+        );
+    }
+    Ok(rows)
+}
+
+/// Converts the batches of a payment table into core payments.
+pub(crate) fn payments(batches: &[RecordBatch]) -> PyResult<Vec<Payment>> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = text(batch, "id")?;
+        let amounts = ints(batch, "amount_minor")?;
+        let currencies = text(batch, "currency")?;
+        let value_dates = dates(batch, "value_date")?;
+        let references = text(batch, "reference")?;
+        let counterparties = text(batch, "counterparty")?;
+        let scopes = scopes(batch)?;
+        rows.extend(
+            ids.into_iter()
+                .zip(amounts)
+                .zip(currencies)
+                .zip(value_dates)
+                .zip(references)
+                .zip(counterparties)
+                .zip(scopes)
+                .map(
+                    |(
+                        (((((id, amount_minor), currency), value_date), reference), counterparty),
+                        scope,
+                    )| {
+                        Payment {
+                            id,
+                            amount_minor,
+                            currency,
+                            value_date,
+                            reference,
+                            counterparty,
+                            scope,
+                        }
+                    },
+                ),
+        );
+    }
+    Ok(rows)
+}
+
+/// Returns the required column `name`, or a `ValueError` when the batch has no such column.
+fn column<'a>(batch: &'a RecordBatch, name: &str) -> PyResult<&'a ArrayRef> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| PyValueError::new_err(format!("missing required column '{name}'")))
+}
+
+/// Returns the `TypeError` for a column whose Arrow type is not accepted.
+fn type_error(name: &str, data_type: &DataType) -> PyErr {
+    PyTypeError::new_err(format!(
+        "column '{name}' has unsupported Arrow type {data_type}"
+    ))
+}
+
+/// Returns the `ValueError` for a null in a used column.
+fn null_error(name: &str) -> PyErr {
+    PyValueError::new_err(format!("column '{name}' contains a null"))
+}
+
+/// Reads a text column: utf8, large_utf8, string_view or a dictionary of one of them.
+fn text(batch: &RecordBatch, name: &str) -> PyResult<Vec<String>> {
+    let original = column(batch, name)?;
+    let array = match original.data_type() {
+        DataType::Dictionary(_, values) => arrow_cast::cast(original, values).map_err(|error| {
+            PyValueError::new_err(format!("column '{name}' cannot be read: {error}"))
+        })?,
+        _ => original.clone(),
+    };
+    let values: Vec<Option<&str>> = match array.data_type() {
+        DataType::Utf8 => array.as_string::<i32>().iter().collect(),
+        DataType::LargeUtf8 => array.as_string::<i64>().iter().collect(),
+        DataType::Utf8View => array.as_string_view().iter().collect(),
+        _ => return Err(type_error(name, original.data_type())),
+    };
+    values
+        .into_iter()
+        .map(|value| value.map(str::to_owned).ok_or_else(|| null_error(name)))
+        .collect()
+}
+
+/// Reads the optional `scope` column; a missing column means the default scope.
+fn scopes(batch: &RecordBatch) -> PyResult<Vec<String>> {
+    if batch.column_by_name("scope").is_some() {
+        text(batch, "scope")
+    } else {
+        Ok(vec![DEFAULT_SCOPE.to_owned(); batch.num_rows()])
+    }
+}
+
+/// Reads an integer column of primitive type `T` as `i64`, failing on any value that does
+/// not fit.
+fn primitive_ints<T>(array: &ArrayRef, name: &str) -> PyResult<Vec<i64>>
+where
+    T: ArrowPrimitiveType,
+    i64: TryFrom<T::Native>,
+{
+    array
+        .as_primitive::<T>()
+        .iter()
+        .map(|value| {
+            let value = value.ok_or_else(|| null_error(name))?;
+            i64::try_from(value).map_err(|_| {
+                PyOverflowError::new_err(format!(
+                    "column '{name}' has the value {value:?}, which does not fit in a signed 64-bit integer"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Reads the amount column: any integer type, never a float or a decimal.
+fn ints(batch: &RecordBatch, name: &str) -> PyResult<Vec<i64>> {
+    let array = column(batch, name)?;
+    match array.data_type() {
+        DataType::Int8 => primitive_ints::<Int8Type>(array, name),
+        DataType::Int16 => primitive_ints::<Int16Type>(array, name),
+        DataType::Int32 => primitive_ints::<Int32Type>(array, name),
+        DataType::Int64 => primitive_ints::<Int64Type>(array, name),
+        DataType::UInt8 => primitive_ints::<UInt8Type>(array, name),
+        DataType::UInt16 => primitive_ints::<UInt16Type>(array, name),
+        DataType::UInt32 => primitive_ints::<UInt32Type>(array, name),
+        DataType::UInt64 => primitive_ints::<UInt64Type>(array, name),
+        other => Err(type_error(name, other)),
+    }
+}
+
+/// Returns the date that is `days` days after 1970-01-01, or a `ValueError` out of range.
+fn from_epoch_days(name: &str, days: i64) -> PyResult<NaiveDate> {
+    i32::try_from(days)
+        .ok()
+        .and_then(NaiveDate::from_epoch_days)
+        .ok_or_else(|| PyValueError::new_err(format!("column '{name}' has a date out of range")))
+}
+
+/// Reads a date column: date32 (days) or date64 (whole days in milliseconds).
+fn dates(batch: &RecordBatch, name: &str) -> PyResult<Vec<NaiveDate>> {
+    let array = column(batch, name)?;
+    match array.data_type() {
+        DataType::Date32 => array
+            .as_primitive::<Date32Type>()
+            .iter()
+            .map(|days| from_epoch_days(name, i64::from(days.ok_or_else(|| null_error(name))?)))
+            .collect(),
+        DataType::Date64 => array
+            .as_primitive::<Date64Type>()
+            .iter()
+            .map(|millis| {
+                let millis = millis.ok_or_else(|| null_error(name))?;
+                if millis.rem_euclid(MILLIS_PER_DAY) != 0 {
+                    return Err(PyValueError::new_err(format!(
+                        "column '{name}' has a date64 value that is not a whole number of days"
+                    )));
+                }
+                from_epoch_days(name, millis.div_euclid(MILLIS_PER_DAY))
+            })
+            .collect(),
+        other => Err(type_error(name, other)),
+    }
+}
