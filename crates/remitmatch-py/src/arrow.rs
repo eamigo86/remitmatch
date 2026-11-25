@@ -17,7 +17,7 @@ use arrow_array::{
     ArrayRef, Float64Array, Int64Array, RecordBatch, RecordBatchReader, StringArray, UInt32Array,
 };
 use arrow_schema::DataType;
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use pyo3::exceptions::{PyOverflowError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
@@ -138,6 +138,18 @@ pub(crate) fn payments(batches: &[RecordBatch]) -> PyResult<Vec<Payment>> {
 
 /// Returns the required column `name`, or a `ValueError` when the batch has no such column.
 fn column<'a>(batch: &'a RecordBatch, name: &str) -> PyResult<&'a ArrayRef> {
+    let schema = batch.schema_ref();
+    if schema
+        .fields()
+        .iter()
+        .filter(|field| field.name() == name)
+        .count()
+        > 1
+    {
+        return Err(PyValueError::new_err(format!(
+            "column '{name}' appears more than once"
+        )));
+    }
     batch
         .column_by_name(name)
         .ok_or_else(|| PyValueError::new_err(format!("missing required column '{name}'")))
@@ -178,7 +190,7 @@ fn text(batch: &RecordBatch, name: &str) -> PyResult<Vec<String>> {
 
 /// Reads the optional `scope` column; a missing column means the default scope.
 fn scopes(batch: &RecordBatch) -> PyResult<Vec<String>> {
-    if batch.column_by_name("scope").is_some() {
+    if batch.schema_ref().column_with_name("scope").is_some() {
         text(batch, "scope")
     } else {
         Ok(vec![DEFAULT_SCOPE.to_owned(); batch.num_rows()])
@@ -222,11 +234,13 @@ fn ints(batch: &RecordBatch, name: &str) -> PyResult<Vec<i64>> {
     }
 }
 
-/// Returns the date that is `days` days after 1970-01-01, or a `ValueError` out of range.
+/// Returns the date that is `days` days after 1970-01-01, or a `ValueError` when it is outside
+/// the years 1 to 9999 that Python's `datetime.date` can hold.
 fn from_epoch_days(name: &str, days: i64) -> PyResult<NaiveDate> {
     i32::try_from(days)
         .ok()
         .and_then(NaiveDate::from_epoch_days)
+        .filter(|date| (1..=9999).contains(&date.year()))
         .ok_or_else(|| PyValueError::new_err(format!("column '{name}' has a date out of range")))
 }
 
