@@ -1,5 +1,8 @@
 """Tests for reconcile through the Python API."""
 
+import os
+import signal
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
@@ -198,3 +201,37 @@ def test_concurrent_calls_agree() -> None:
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = list(pool.map(lambda _: reconcile(invoices, payments), range(32)))
     assert all(result == expected for result in results)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_a_forked_child_can_reconcile_after_the_parent_did() -> None:
+    """A child forked after the parent used reconcile finishes a multi-scope run.
+
+    The parent's worker threads do not exist in the child, so the child must not wait for
+    them. Only this order is covered: forking before the parent's first call is not possible
+    inside one pytest process.
+    """
+    scopes = 8
+    invoices = [
+        Invoice(f"i{n}", f"INV-{n}", 1_000 + n, "EUR", DAY, DAY, "Acme S.L.", f"s{n % scopes}")
+        for n in range(200)
+    ]
+    payments = [
+        Payment(f"p{n}", 1_000 + n, "EUR", DAY, f"INV-{n}", "ACME", f"s{n % scopes}")
+        for n in range(200)
+    ]
+    assert len(reconcile(invoices, payments).matches) == 200
+    with warnings.catch_warnings():
+        # Python warns about forking a multi-threaded process; the child only runs reconcile.
+        warnings.simplefilter("ignore", DeprecationWarning)
+        pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            signal.alarm(20)
+            code = 0 if len(reconcile(invoices, payments).matches) == 200 else 3
+        finally:
+            os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    assert os.WIFEXITED(status), f"the child was killed by signal {os.WTERMSIG(status)}"
+    assert os.WEXITSTATUS(status) == 0
