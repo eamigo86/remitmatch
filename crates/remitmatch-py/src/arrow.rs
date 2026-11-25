@@ -14,7 +14,8 @@ use arrow_array::types::{
 use std::sync::Arc;
 
 use arrow_array::{
-    ArrayRef, Float64Array, Int64Array, RecordBatch, RecordBatchReader, StringArray, UInt32Array,
+    ArrayRef, Float64Array, Int64Array, LargeStringArray, RecordBatch, RecordBatchReader,
+    StringArray, StringViewArray, UInt32Array,
 };
 use arrow_schema::DataType;
 use chrono::{Datelike, NaiveDate};
@@ -52,7 +53,7 @@ pub(crate) fn read_stream(obj: &Bound<'_, PyAny>) -> PyResult<Option<Vec<RecordB
 
 /// Converts the batches of an invoice table into core invoices.
 pub(crate) fn invoices(batches: &[RecordBatch]) -> PyResult<Vec<Invoice>> {
-    let mut rows = Vec::new();
+    let mut rows = Vec::with_capacity(batches.iter().map(RecordBatch::num_rows).sum());
     for batch in batches {
         let ids = text(batch, "id")?;
         let numbers = text(batch, "number")?;
@@ -62,43 +63,23 @@ pub(crate) fn invoices(batches: &[RecordBatch]) -> PyResult<Vec<Invoice>> {
         let due_dates = dates(batch, "due_date")?;
         let counterparties = text(batch, "counterparty")?;
         let scopes = scopes(batch)?;
-        rows.extend(
-            ids.into_iter()
-                .zip(numbers)
-                .zip(amounts)
-                .zip(currencies)
-                .zip(issue_dates)
-                .zip(due_dates)
-                .zip(counterparties)
-                .zip(scopes)
-                .map(
-                    |(
-                        (
-                            (((((id, number), amount_minor), currency), issue_date), due_date),
-                            counterparty,
-                        ),
-                        scope,
-                    )| {
-                        Invoice {
-                            id,
-                            number,
-                            amount_minor,
-                            currency,
-                            issue_date,
-                            due_date,
-                            counterparty,
-                            scope,
-                        }
-                    },
-                ),
-        );
+        rows.extend((0..batch.num_rows()).map(|row| Invoice {
+            id: ids.value(row).to_owned(),
+            number: numbers.value(row).to_owned(),
+            amount_minor: amounts[row],
+            currency: currencies.value(row).to_owned(),
+            issue_date: issue_dates[row],
+            due_date: due_dates[row],
+            counterparty: counterparties.value(row).to_owned(),
+            scope: scopes.value(row).to_owned(),
+        }));
     }
     Ok(rows)
 }
 
 /// Converts the batches of a payment table into core payments.
 pub(crate) fn payments(batches: &[RecordBatch]) -> PyResult<Vec<Payment>> {
-    let mut rows = Vec::new();
+    let mut rows = Vec::with_capacity(batches.iter().map(RecordBatch::num_rows).sum());
     for batch in batches {
         let ids = text(batch, "id")?;
         let amounts = ints(batch, "amount_minor")?;
@@ -107,31 +88,15 @@ pub(crate) fn payments(batches: &[RecordBatch]) -> PyResult<Vec<Payment>> {
         let references = text(batch, "reference")?;
         let counterparties = text(batch, "counterparty")?;
         let scopes = scopes(batch)?;
-        rows.extend(
-            ids.into_iter()
-                .zip(amounts)
-                .zip(currencies)
-                .zip(value_dates)
-                .zip(references)
-                .zip(counterparties)
-                .zip(scopes)
-                .map(
-                    |(
-                        (((((id, amount_minor), currency), value_date), reference), counterparty),
-                        scope,
-                    )| {
-                        Payment {
-                            id,
-                            amount_minor,
-                            currency,
-                            value_date,
-                            reference,
-                            counterparty,
-                            scope,
-                        }
-                    },
-                ),
-        );
+        rows.extend((0..batch.num_rows()).map(|row| Payment {
+            id: ids.value(row).to_owned(),
+            amount_minor: amounts[row],
+            currency: currencies.value(row).to_owned(),
+            value_date: value_dates[row],
+            reference: references.value(row).to_owned(),
+            counterparty: counterparties.value(row).to_owned(),
+            scope: scopes.value(row).to_owned(),
+        }));
     }
     Ok(rows)
 }
@@ -167,8 +132,29 @@ fn null_error(name: &str) -> PyErr {
     PyValueError::new_err(format!("column '{name}' contains a null"))
 }
 
+/// A text column without nulls, read in place.
+enum Text {
+    Utf8(StringArray),
+    LargeUtf8(LargeStringArray),
+    Utf8View(StringViewArray),
+    /// Every row has this value (the default scope of a table without a scope column).
+    Constant(&'static str),
+}
+
+impl Text {
+    /// Returns the value of row `row`, which must be below the number of rows of the batch.
+    fn value(&self, row: usize) -> &str {
+        match self {
+            Self::Utf8(array) => array.value(row),
+            Self::LargeUtf8(array) => array.value(row),
+            Self::Utf8View(array) => array.value(row),
+            Self::Constant(value) => value,
+        }
+    }
+}
+
 /// Reads a text column: utf8, large_utf8, string_view or a dictionary of one of them.
-fn text(batch: &RecordBatch, name: &str) -> PyResult<Vec<String>> {
+fn text(batch: &RecordBatch, name: &str) -> PyResult<Text> {
     let original = column(batch, name)?;
     let array = match original.data_type() {
         DataType::Dictionary(_, values) => arrow_cast::cast(original, values).map_err(|error| {
@@ -176,24 +162,24 @@ fn text(batch: &RecordBatch, name: &str) -> PyResult<Vec<String>> {
         })?,
         _ => original.clone(),
     };
-    let values: Vec<Option<&str>> = match array.data_type() {
-        DataType::Utf8 => array.as_string::<i32>().iter().collect(),
-        DataType::LargeUtf8 => array.as_string::<i64>().iter().collect(),
-        DataType::Utf8View => array.as_string_view().iter().collect(),
+    let column = match array.data_type() {
+        DataType::Utf8 => Text::Utf8(array.as_string::<i32>().clone()),
+        DataType::LargeUtf8 => Text::LargeUtf8(array.as_string::<i64>().clone()),
+        DataType::Utf8View => Text::Utf8View(array.as_string_view().clone()),
         _ => return Err(type_error(name, original.data_type())),
     };
-    values
-        .into_iter()
-        .map(|value| value.map(str::to_owned).ok_or_else(|| null_error(name)))
-        .collect()
+    if array.null_count() > 0 {
+        return Err(null_error(name));
+    }
+    Ok(column)
 }
 
 /// Reads the optional `scope` column; a missing column means the default scope.
-fn scopes(batch: &RecordBatch) -> PyResult<Vec<String>> {
+fn scopes(batch: &RecordBatch) -> PyResult<Text> {
     if batch.schema_ref().column_with_name("scope").is_some() {
         text(batch, "scope")
     } else {
-        Ok(vec![DEFAULT_SCOPE.to_owned(); batch.num_rows()])
+        Ok(Text::Constant(DEFAULT_SCOPE))
     }
 }
 
