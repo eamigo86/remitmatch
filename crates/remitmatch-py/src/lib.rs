@@ -21,7 +21,7 @@ mod arrow;
 use std::collections::BTreeMap;
 
 use chrono::NaiveDate;
-use pyo3::exceptions::{PyImportError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyImportError, PyModuleNotFoundError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyTuple, PyType};
@@ -685,6 +685,16 @@ impl PyReconciliationResult {
     ///     ImportError: pyarrow is not installed; install it with the arrow extra.
     fn to_arrow<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         py.import("pyarrow").map_err(|cause| {
+            // Only a missing pyarrow gets the install hint; a broken install propagates as is.
+            let missing = cause.is_instance_of::<PyModuleNotFoundError>(py)
+                && cause
+                    .value(py)
+                    .getattr("name")
+                    .and_then(|name| name.extract::<String>())
+                    .is_ok_and(|name| name == "pyarrow");
+            if !missing {
+                return cause;
+            }
             let error = PyImportError::new_err(
                 "to_arrow needs pyarrow; install it with: pip install \"remitmatch[arrow]\"",
             );

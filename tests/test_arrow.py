@@ -527,3 +527,106 @@ def test_input_does_not_need_pyarrow_to_be_importable(monkeypatch: pytest.Monkey
     monkeypatch.setitem(sys.modules, "pyarrow", None)
     result = reconcile(INVOICES, PAYMENTS)
     assert len(result.matches) == 1
+
+
+def test_duplicate_used_column_raises_value_error() -> None:
+    """A used column name that appears twice is ambiguous and raises ValueError."""
+    table = invoice_table(INVOICES)
+    twice = table.append_column("id", table.column("id"))
+    with pytest.raises(ValueError, match="column 'id' appears more than once"):
+        reconcile(twice, payment_table(PAYMENTS))
+    mixed = payment_table(PAYMENTS)
+    mixed = mixed.append_column("amount_minor", pa.array([1.0] * mixed.num_rows, pa.float64()))
+    with pytest.raises(ValueError, match="column 'amount_minor' appears more than once"):
+        reconcile(invoice_table(INVOICES), mixed)
+
+
+def test_duplicate_optional_scope_column_raises_value_error() -> None:
+    """The optional scope column must be unique when it is present."""
+    table = invoice_table(INVOICES)
+    twice = table.append_column("scope", table.column("scope"))
+    with pytest.raises(ValueError, match="column 'scope' appears more than once"):
+        reconcile(twice, payment_table(PAYMENTS))
+
+
+def test_duplicate_unused_columns_are_ignored() -> None:
+    """Duplicate names among columns the engine does not use stay ignored."""
+    table = invoice_table(INVOICES)
+    note = pa.array(["x"] * table.num_rows)
+    twice = table.append_column("note", note).append_column("note", note)
+    assert reconcile(twice, payment_table(PAYMENTS)) == EXPECTED
+
+
+@pytest.mark.parametrize("days", [-719_163, 2_932_897, -(2**31), 2**31 - 1])
+def test_dates_outside_the_python_range_raise_value_error(days: int) -> None:
+    """Dates before year 1 or after year 9999 are rejected, like the object API cannot hold them."""
+    bad = pa.array([days] * len(INVOICES), pa.date32())
+    with pytest.raises(ValueError, match="issue_date"):
+        reconcile(invoice_table(INVOICES, issue_date=bad), payment_table(PAYMENTS))
+    millis = pa.array([days * 86_400_000] * len(INVOICES), pa.date64())
+    with pytest.raises(ValueError, match="due_date"):
+        reconcile(invoice_table(INVOICES, due_date=millis), payment_table(PAYMENTS))
+
+
+@pytest.mark.parametrize("days", [-719_162, 2_932_896])
+def test_the_first_and_last_python_dates_are_accepted(days: int) -> None:
+    """Year 1 January 1 and year 9999 December 31 are valid, as in the object API."""
+    edge = date.fromordinal(days + 719_163)
+    invoices = [Invoice("i1", "INV-1", 100, "EUR", edge, edge, "Acme", "main")]
+    pays = [Payment("p1", 100, "EUR", edge, "INV-1", "Acme", "main")]
+    from_table = reconcile(invoice_table(invoices), payment_table(pays))
+    assert from_table == reconcile(invoices, pays)
+
+
+class _FailingFinder:
+    """Meta path finder that makes the import of pyarrow raise a chosen exception."""
+
+    def __init__(self, error: ImportError) -> None:
+        """Remember the exception to raise.
+
+        Args:
+            error: Exception raised when pyarrow is imported.
+        """
+        self.error = error
+
+    def find_spec(self, name: str, path: object = None, target: object = None) -> None:
+        """Raise the chosen exception for pyarrow and ignore every other module.
+
+        Args:
+            name: Module being imported.
+            path: Ignored.
+            target: Ignored.
+
+        Raises:
+            ImportError: When name is pyarrow.
+        """
+        if name == "pyarrow":
+            raise self.error
+
+
+def test_other_import_failures_of_pyarrow_propagate_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a missing pyarrow gives the install hint; any other import failure is not hidden."""
+    monkeypatch.delitem(sys.modules, "pyarrow")
+    for error in (
+        ImportError("broken pyarrow install"),
+        ModuleNotFoundError("No module named 'numpy'", name="numpy"),
+    ):
+        finder = _FailingFinder(error)
+        monkeypatch.setattr(sys, "meta_path", [finder, *sys.meta_path])
+        with pytest.raises(ImportError) as raised:
+            EXPECTED.to_arrow()
+        assert raised.value is error
+        monkeypatch.setattr(sys, "meta_path", sys.meta_path[1:])
+
+
+def test_a_module_not_found_for_pyarrow_itself_gives_the_install_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ModuleNotFoundError for pyarrow itself names the arrow extra."""
+    monkeypatch.delitem(sys.modules, "pyarrow")
+    error = ModuleNotFoundError("No module named 'pyarrow'", name="pyarrow")
+    monkeypatch.setattr(sys, "meta_path", [_FailingFinder(error), *sys.meta_path])
+    with pytest.raises(ImportError, match=r"remitmatch\[arrow\]"):
+        EXPECTED.to_arrow()
