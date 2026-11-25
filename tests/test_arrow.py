@@ -749,3 +749,23 @@ def test_a_module_not_found_for_pyarrow_itself_gives_the_install_hint(
     monkeypatch.setattr(sys, "meta_path", [_FailingFinder(error), *sys.meta_path])
     with pytest.raises(ImportError, match=r"remitmatch\[arrow\]"):
         EXPECTED.to_arrow()
+
+
+def test_an_object_that_is_both_a_sequence_and_an_arrow_stream_is_read_as_a_table() -> None:
+    """An Arrow stream export wins over the sequence protocol."""
+
+    class SequenceTable(list):  # type: ignore[type-arg]
+        """List whose elements are not invoices but which exports the rows as a table."""
+
+        def __arrow_c_stream__(self, requested_schema: object = None) -> object:
+            """Export the invoice table.
+
+            Args:
+                requested_schema: Ignored.
+
+            Returns:
+                The Arrow stream capsule of the invoice table.
+            """
+            return invoice_table(INVOICES).__arrow_c_stream__(None)
+
+    assert reconcile(SequenceTable(["not an invoice"]), PAYMENTS) == EXPECTED

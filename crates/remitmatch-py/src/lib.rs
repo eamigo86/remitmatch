@@ -676,10 +676,12 @@ impl PyReconciliationResult {
     /// residual_minor (int64, repeated on each row of the match) and the per-signal scores
     /// reference_score, amount_score, name_score and date_score (float64). Unmatched ids are
     /// not included. A result without matches gives an empty table with the same columns.
-    /// The pyarrow package is imported when this method is called.
+    /// The pyarrow package is imported when this method is called, and an import failure other
+    /// than a missing pyarrow propagates unchanged.
     ///
     /// Returns:
-    ///     A pyarrow Table with one row for each payment-invoice pair in every match.
+    ///     One row for each payment-invoice pair in every match, with the columns above, ordered by
+    ///     match, then payment, then invoice.
     ///
     /// Raises:
     ///     ImportError: pyarrow is not installed; install it with the arrow extra.
@@ -731,6 +733,10 @@ impl PyReconciliationResult {
 /// missing one means the default scope. Text columns may be any Arrow string type or a
 /// dictionary of strings, amount_minor any integer type that fits a signed 64-bit integer,
 /// and dates date32 or date64. Floats, decimals and timestamps are rejected.
+///
+/// An object that exports an Arrow stream is always read as a table, even if it is also a
+/// sequence. A column name used by the engine must be unique in the table, while unused
+/// columns may repeat names. A reader that was already consumed yields no rows.
 ///
 /// Args:
 ///     invoices: Open invoices to settle, as a sequence such as a list or tuple (any
