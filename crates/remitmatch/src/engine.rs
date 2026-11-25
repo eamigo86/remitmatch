@@ -147,35 +147,53 @@ pub(crate) fn reconcile(
     config: &MatchConfig,
 ) -> Result<ReconciliationResult, Error> {
     validate(invoices, payments, config)?;
-    let invoice_number: Vec<String> = invoices
-        .iter()
-        .map(|i| normalize_reference(&i.number).text)
-        .collect();
-    let payment_reference: Vec<Reference> = payments
-        .iter()
-        .map(|p| normalize_reference(&p.reference))
-        .collect();
+    let owner = *POOL_OWNER.get_or_init(std::process::id);
+    reconcile_validated(
+        invoices,
+        payments,
+        config,
+        runs_in_parallel(owner, std::process::id()),
+    )
+}
+
+/// Maps every row with `f`, keeping the input order; the rows run on the thread pool only
+/// when `parallel` is set.
+fn map_rows<T: Sync, U: Send>(
+    rows: &[T],
+    parallel: bool,
+    f: impl Fn(&T) -> U + Sync + Send,
+) -> Vec<U> {
+    if parallel {
+        rows.par_iter().map(f).collect()
+    } else {
+        rows.iter().map(f).collect()
+    }
+}
+
+/// Runs the engine on validated input, with the per-row setup and the partitions on the
+/// thread pool when `parallel` is set.
+fn reconcile_validated(
+    invoices: &[Invoice],
+    payments: &[Payment],
+    config: &MatchConfig,
+    parallel: bool,
+) -> Result<ReconciliationResult, Error> {
+    let invoice_number = map_rows(invoices, parallel, |i| normalize_reference(&i.number).text);
+    let payment_reference = map_rows(payments, parallel, |p| normalize_reference(&p.reference));
     let engine = Engine {
         invoices,
         payments,
         config,
         weights: Weights::from_map(&config.weights),
         tolerance: u64::try_from(config.amount_tolerance_minor).unwrap_or(0),
-        invoice_number_counts: invoice_number.iter().map(|n| CharCounts::of(n)).collect(),
+        invoice_number_counts: map_rows(&invoice_number, parallel, |n| CharCounts::of(n)),
         invoice_number,
-        invoice_name: invoices
-            .iter()
-            .map(|i| normalize_name(&i.counterparty))
-            .collect(),
-        payment_reference_counts: payment_reference
-            .iter()
-            .map(|r| CharCounts::of(&r.text))
-            .collect(),
+        invoice_name: map_rows(invoices, parallel, |i| normalize_name(&i.counterparty)),
+        payment_reference_counts: map_rows(&payment_reference, parallel, |r| {
+            CharCounts::of(&r.text)
+        }),
         payment_reference,
-        payment_name: payments
-            .iter()
-            .map(|p| normalize_name(&p.counterparty))
-            .collect(),
+        payment_name: map_rows(payments, parallel, |p| normalize_name(&p.counterparty)),
         skip_unnamed: cannot_matter(&Weights::from_map(&config.weights), config, 0.0),
     };
     let partitions = engine.partitions();
@@ -189,23 +207,21 @@ pub(crate) fn reconcile(
     let payment_taken: Vec<AtomicBool> = (0..payments.len())
         .map(|_| AtomicBool::new(false))
         .collect();
-    let owner = *POOL_OWNER.get_or_init(std::process::id);
-    let outcomes: Vec<Result<Vec<(usize, Match)>, Error>> =
-        if runs_in_parallel(owner, std::process::id()) {
-            partitions
-                .par_iter()
-                .map(|(invoice_rows, payment_rows)| {
-                    engine.run_partition(&invoice_taken, &payment_taken, invoice_rows, payment_rows)
-                })
-                .collect()
-        } else {
-            partitions
-                .iter()
-                .map(|(invoice_rows, payment_rows)| {
-                    engine.run_partition(&invoice_taken, &payment_taken, invoice_rows, payment_rows)
-                })
-                .collect()
-        };
+    let outcomes: Vec<Result<Vec<(usize, Match)>, Error>> = if parallel {
+        partitions
+            .par_iter()
+            .map(|(invoice_rows, payment_rows)| {
+                engine.run_partition(&invoice_taken, &payment_taken, invoice_rows, payment_rows)
+            })
+            .collect()
+    } else {
+        partitions
+            .iter()
+            .map(|(invoice_rows, payment_rows)| {
+                engine.run_partition(&invoice_taken, &payment_taken, invoice_rows, payment_rows)
+            })
+            .collect()
+    };
     let mut found = Vec::new();
     for outcome in outcomes {
         found.extend(outcome?);
@@ -237,14 +253,14 @@ fn cannot_matter(weights: &Weights, config: &MatchConfig, reference: f64) -> boo
         && !meets(bound, config.suggest_threshold)
 }
 
-/// The process that first ran partitions in parallel, which is the one that owns the pool.
+/// The process that first ran `reconcile`, which is the one that owns the thread pool.
 static POOL_OWNER: OnceLock<u32> = OnceLock::new();
 
 /// Returns whether the process `current` may use the thread pool that `owner` started.
 ///
 /// A process forked after its parent used rayon inherits the pool's bookkeeping but none of
 /// its worker threads, so waiting for them would never return.
-// ponytail: a child forked after the parent's first call runs its partitions sequentially.
+// ponytail: a child forked after the parent's first call runs sequentially, setup included.
 // Upgrade: a per-process pool rebuilt after the fork (for example with a pthread_atfork hook).
 fn runs_in_parallel(owner: u32, current: u32) -> bool {
     owner == current
@@ -994,6 +1010,38 @@ mod tests {
             }
         }
         (invoices, payments)
+    }
+
+    #[test]
+    fn map_rows_keeps_the_input_order_in_both_modes() {
+        let rows: Vec<u32> = (0..1_000).collect();
+        let expected: Vec<u32> = rows.iter().map(|n| n * 2).collect();
+        assert_eq!(map_rows(&rows, true, |n| n * 2), expected);
+        assert_eq!(map_rows(&rows, false, |n| n * 2), expected);
+    }
+
+    #[test]
+    fn map_rows_leaves_the_thread_pool_alone_unless_asked() {
+        // The test thread is not a pool worker, so a parallel call hands every row to a
+        // worker and a sequential call keeps every row here.
+        let rows: Vec<u32> = (0..1_000).collect();
+        let on_worker =
+            |parallel: bool| map_rows(&rows, parallel, |_| rayon::current_thread_index());
+        assert!(on_worker(false).iter().all(Option::is_none));
+        assert!(on_worker(true).iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn a_sequential_run_gives_the_same_result_as_a_parallel_one() {
+        let (invoices, payments) = many_partitions(30);
+        let config = MatchConfig {
+            suggest_threshold: 0.3,
+            ..MatchConfig::default()
+        };
+        let parallel = reconcile_validated(&invoices, &payments, &config, true).unwrap();
+        let sequential = reconcile_validated(&invoices, &payments, &config, false).unwrap();
+        assert!(parallel.matches.len() > 30, "the data must produce matches");
+        assert_eq!(parallel, sequential);
     }
 
     #[test]
