@@ -240,6 +240,66 @@ with the same schema.
 "Zero-copy" here means that no Python object is created per row: batches are read through the
 C stream and each value is copied once into the core structs. The core itself is not columnar.
 
+## Benchmarks
+
+`remitmatch` was compared with two ways of doing the same job in Python, on the same
+synthetic data: a pure Python baseline (standard library only) and a pandas + rapidfuzz
+baseline. Both are 1:1 matchers written for this benchmark, and both were made as fast as a
+plain formulation reasonably gets. Time is the matching call alone, including the conversion
+of the answer to groups of ids; peak memory is the whole process.
+
+On one-to-one data (no grouped or partial payments), `remitmatch` is **not faster** than the
+baselines at the sizes measured: it is about 1.3 to 1.5 times slower than pandas + rapidfuzz
+at 10,000, 100,000 and 1,000,000 payments, and slower than pure Python at 10,000 and 100,000
+payments but faster at 1,000,000. It uses the most memory at the two larger sizes. The project
+target of 20 times over pandas + rapidfuzz is **not met**: the measured ratio is 0.78, 0.68
+and 0.76.
+
+![Run time by number of payments for remitmatch, pure Python and pandas + rapidfuzz on the one-to-one dataset](https://raw.githubusercontent.com/eamigo86/remitmatch/main/benchmarks/results/time.png)
+
+| Payments | Implementation | Time | Peak memory | Precision | Recall | Precision of `auto` matches |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 10,000 | remitmatch | 0.035 s | 181 MB | 100.000 % | 94.81 % | 100.000 % (7,863 matches) |
+| 10,000 | Pure Python | 0.025 s | 166 MB | 100.000 % | 94.91 % | n/a |
+| 10,000 | pandas + rapidfuzz | 0.027 s | 161 MB | 100.000 % | 94.91 % | n/a |
+| 100,000 | remitmatch | 0.339 s | 499 MB | 100.000 % | 94.79 % | 100.000 % (78,976 matches) |
+| 100,000 | Pure Python | 0.295 s | 402 MB | 99.999 % | 94.88 % | n/a |
+| 100,000 | pandas + rapidfuzz | 0.229 s | 291 MB | 99.999 % | 94.88 % | n/a |
+| 1,000,000 | remitmatch | 3.731 s | 3,260 MB | 100.000 % | 94.80 % | 100.000 % (790,907 matches) |
+| 1,000,000 | Pure Python | 4.229 s | 2,717 MB | 99.999 % | 94.91 % | n/a |
+| 1,000,000 | pandas + rapidfuzz | 2.824 s | 1,573 MB | 99.999 % | 94.91 % | n/a |
+
+Recall stops near 95 % for every implementation because the 5 % of payments in the data that
+carry no invoice number cannot be matched by reference.
+
+The baselines cannot match a payment to several invoices or several payments to one invoice.
+On the `mixed` dataset, which contains both, `remitmatch` finds 93.9 to 94.9 % of the true
+groups and both baselines 88.1 to 88.5 %, with precision of 99.9 % or better for all three;
+at 1,000,000 payments the times are 4.244 s for `remitmatch`, 5.481 s for pure Python and
+2.700 s for pandas + rapidfuzz. The full tables, with build times and every run, are in
+[`benchmarks/README.md`](https://github.com/eamigo86/remitmatch/blob/main/benchmarks/README.md).
+
+Read the numbers with these caveats:
+
+- The data is synthetic, from the generator of the accuracy tests, and the default weights
+  were tuned on it. Precision here says nothing about real bank statements.
+- In 95 % of the payments the reference contains the invoice number, in one of a few formats,
+  which makes an exact dictionary lookup very effective. The baselines assume the invoice numbers start with `INV`;
+  `remitmatch` does not need to know the prefix.
+- One machine (Apple M3 Max, 16 threads, 128 GB, macOS, Python 3.14) shared with other work,
+  with a load average of about 4 to 5 during the run, a release build of `remitmatch`
+  0.1.0a2, best of 3 runs up to 100,000 payments and a single run at 1,000,000. The garbage
+  collector was off during every timed call.
+- Four scopes and two currencies, so eight partitions that run in parallel. A single large
+  scope was not measured.
+- reconPy, which the RFC mentions, is not included: it only takes a percentage tolerance and
+  joins on exact columns, so it cannot express "within 300 minor units" and would build every
+  pair within a scope. See [`benchmarks/README.md`](https://github.com/eamigo86/remitmatch/blob/main/benchmarks/README.md).
+
+To reproduce: `uv sync --group bench`, `uv run --no-sync maturin develop --release`, then
+`uv run --no-sync python benchmarks/run.py --remitmatch-build release`. The details are in
+`benchmarks/README.md`.
+
 ## Rust
 
 The matching engine is a plain Rust crate with the same `reconcile` entry point:
