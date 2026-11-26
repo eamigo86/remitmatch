@@ -19,6 +19,7 @@
 //! floating-point numbers.
 
 mod engine;
+mod fasthash;
 mod normalize;
 mod score;
 mod subset;
