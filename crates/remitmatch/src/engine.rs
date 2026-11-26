@@ -207,6 +207,77 @@ impl NameScores {
     }
 }
 
+/// Most distinct number lengths for which numbers are looked up by hash instead of scanned
+/// with an automaton.
+// ponytail: building an automaton for tens of thousands of numbers costs about three times
+// its scan, while each length adds one hash lookup per byte of the reference. Upgrade: pick
+// per partition from measured costs if lengths vary widely.
+const HASHED_LENGTHS_MAX: usize = 3;
+
+/// Finds the invoice numbers that occur in a text, with the invoices that carry each number.
+enum NumberIndex<'a> {
+    /// Looks up every substring of one of the few lengths that numbers have.
+    Lengths {
+        lengths: Vec<usize>,
+        groups: FastMap<&'a str, Vec<usize>>,
+    },
+    /// Scans the text once for all numbers.
+    Automaton {
+        automaton: AhoCorasick,
+        groups: Vec<Vec<usize>>,
+    },
+}
+
+impl<'a> NumberIndex<'a> {
+    /// Indexes the distinct non-empty `numbers`, each with its invoices; at most
+    /// `max_lengths` distinct byte lengths are looked up by hash, otherwise an automaton
+    /// is built.
+    fn new(numbers: Vec<(&'a str, Vec<usize>)>, max_lengths: usize) -> Result<Self, Error> {
+        let mut lengths: Vec<usize> = numbers.iter().map(|(number, _)| number.len()).collect();
+        lengths.sort_unstable();
+        lengths.dedup();
+        if lengths.len() <= max_lengths {
+            return Ok(Self::Lengths {
+                lengths,
+                groups: numbers.into_iter().collect(),
+            });
+        }
+        let automaton = AhoCorasick::builder()
+            .match_kind(AcMatchKind::Standard)
+            .build(numbers.iter().map(|(number, _)| number))
+            .map_err(|e| Error::ReferenceIndex(e.to_string()))?;
+        Ok(Self::Automaton {
+            automaton,
+            groups: numbers.into_iter().map(|(_, rows)| rows).collect(),
+        })
+    }
+
+    /// Calls `visit` with the byte range and the invoices of every occurrence of a number in
+    /// `text`, overlapping ones included.
+    fn find(&self, text: &str, mut visit: impl FnMut(usize, usize, &[usize])) {
+        match self {
+            Self::Lengths { lengths, groups } => {
+                for start in 0..text.len() {
+                    for &length in lengths {
+                        // `get` is `None` past the end and off a character boundary.
+                        let rows = text
+                            .get(start..start + length)
+                            .and_then(|piece| groups.get(piece));
+                        if let Some(rows) = rows {
+                            visit(start, start + length, rows);
+                        }
+                    }
+                }
+            }
+            Self::Automaton { automaton, groups } => {
+                for hit in automaton.find_overlapping_iter(text) {
+                    visit(hit.start(), hit.end(), &groups[hit.pattern().as_usize()]);
+                }
+            }
+        }
+    }
+}
+
 /// Which rows are already matched in one partition, plus the matches found so far.
 ///
 /// The flags are shared by all partitions and indexed by input row. A partition only reads
@@ -674,7 +745,7 @@ impl Engine<'_> {
         invoice_rows: &[usize],
         payment_rows: &[usize],
     ) -> Result<(Vec<Candidate>, Mentions), Error> {
-        let mut by_number: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        let mut by_number: FastMap<&str, Vec<usize>> = FastMap::default();
         for &i in invoice_rows {
             let number = self.invoice_number[i].as_str();
             if !number.is_empty() {
@@ -686,19 +757,15 @@ impl Engine<'_> {
         if by_number.is_empty() {
             return Ok((candidates, all_mentions));
         }
-        let automaton = AhoCorasick::builder()
-            .match_kind(AcMatchKind::Standard)
-            .build(by_number.keys())
-            .map_err(|e| Error::ReferenceIndex(e.to_string()))?;
-        let groups: Vec<&Vec<usize>> = by_number.values().collect();
+        let index = NumberIndex::new(by_number.into_iter().collect(), HASHED_LENGTHS_MAX)?;
         for &p in payment_rows {
             let reference = &self.payment_reference[p];
             let mut mentioned = BTreeSet::new();
-            for hit in automaton.find_overlapping_iter(&reference.text) {
-                if is_mention(reference, hit.start(), hit.end()) {
-                    mentioned.extend(groups[hit.pattern().as_usize()].iter().copied());
+            index.find(&reference.text, |start, end, rows| {
+                if is_mention(reference, start, end) {
+                    mentioned.extend(rows.iter().copied());
                 }
-            }
+            });
             if mentioned.is_empty() {
                 continue;
             }
@@ -1349,6 +1416,77 @@ mod tests {
             within_days(&[0], |r| last[r], NaiveDate::MAX, u32::MAX),
             [0]
         );
+    }
+
+    /// Every occurrence the index reports in `text`, sorted.
+    fn occurrences(index: &NumberIndex<'_>, text: &str) -> Vec<(usize, usize, Vec<usize>)> {
+        let mut found = Vec::new();
+        index.find(text, |start, end, rows| {
+            found.push((start, end, rows.to_vec()))
+        });
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn numbers_are_found_by_lookup_and_by_automaton_alike() {
+        let numbers = || {
+            vec![
+                ("INV1", vec![0, 4]),
+                ("INV12", vec![1]),
+                ("12", vec![2]),
+                ("É1", vec![3]),
+            ]
+        };
+        let by_lookup = NumberIndex::new(numbers(), 4).unwrap();
+        let by_automaton = NumberIndex::new(numbers(), 0).unwrap();
+        assert!(matches!(by_lookup, NumberIndex::Lengths { .. }));
+        assert!(matches!(by_automaton, NumberIndex::Automaton { .. }));
+        for text in ["", "INV12", "PAGO INV1 INV12 12INV1", "É1É1 INV121", "INV"] {
+            assert_eq!(
+                occurrences(&by_lookup, text),
+                occurrences(&by_automaton, text),
+                "{text}"
+            );
+        }
+        let overlapping = occurrences(&by_lookup, "INV12");
+        assert_eq!(
+            overlapping,
+            vec![(0, 4, vec![0, 4]), (0, 5, vec![1]), (3, 5, vec![2])]
+        );
+    }
+
+    #[test]
+    fn more_lengths_than_the_limit_use_the_automaton() {
+        let numbers = vec![("AB", vec![0]), ("ABC", vec![1]), ("ABCD", vec![2])];
+        assert!(matches!(
+            NumberIndex::new(numbers.clone(), 3).unwrap(),
+            NumberIndex::Lengths { .. }
+        ));
+        assert!(matches!(
+            NumberIndex::new(numbers, 2).unwrap(),
+            NumberIndex::Automaton { .. }
+        ));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn lookup_and_automaton_find_the_same_occurrences(
+            patterns in proptest::collection::btree_set("[AB1\u{c9}]{1,4}", 1..12),
+            text in "[AB1\u{c9} ]{0,30}",
+        ) {
+            let numbers: Vec<(&str, Vec<usize>)> = patterns
+                .iter()
+                .enumerate()
+                .map(|(k, p)| (p.as_str(), vec![k, k + 100]))
+                .collect();
+            let by_lookup = NumberIndex::new(numbers.clone(), usize::MAX).unwrap();
+            let by_automaton = NumberIndex::new(numbers, 0).unwrap();
+            proptest::prop_assert_eq!(
+                occurrences(&by_lookup, &text),
+                occurrences(&by_automaton, &text)
+            );
+        }
     }
 
     #[test]
