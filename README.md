@@ -242,9 +242,9 @@ C stream and each value is copied once into the core structs. The core itself is
 
 ## Benchmarks
 
-On data spread over several scopes, `remitmatch` on all 16 threads of the test machine finishes sooner than the single-threaded Python baselines on one-to-one data (1.36 to 1.71 times faster than pandas + rapidfuzz, 1.96 to 3.37 times faster than pure Python), but that comes from the threads: on one thread it is slower than both (1.87 to 2.47 times slower than pandas + rapidfuzz, 1.12 to 1.40 times slower than pure Python), and with one large scope it is slower than both even on all threads (1.84 to 3.21 and 1.23 to 1.53 times slower). On data with grouped and partial payments it finds more of the true groups (93.1 to 94.9 % against 88.1 to 88.5 %); the target of 20 times over pandas + rapidfuzz is not met in any layout.
+With the data spread over several scopes, `remitmatch` on all 16 threads of the test machine is 1.87 to 2.41 times faster than pandas + rapidfuzz and 2.14 to 5.08 times faster than pure Python on one-to-one data. On one thread it is about equal to pandas + rapidfuzz at 10,000 payments (0.96 times as long) and 1.22 and 1.15 times slower at 100,000 and 1,000,000, and still 1.19 to 1.84 times faster than pure Python. With one large scope it is 1.40, 1.00 and 1.12 times as fast as pandas + rapidfuzz on all threads. On data with grouped and partial payments it finds more of the true groups (93.1 to 94.9 % against 88.1 to 88.5 %), and is 1.58, 1.11 and 1.61 times as fast as pandas + rapidfuzz with four scopes but 2.55 to 2.82 times slower with one scope. The target of 20 times over pandas + rapidfuzz is not met in any layout (the best ratio is 2.41), and the peak memory of `remitmatch` is higher than that of pandas + rapidfuzz at every size.
 
-`remitmatch` was compared with two ways of doing the same job in Python on the same synthetic data: a pure Python baseline (standard library only) and a pandas + rapidfuzz baseline. Both are one-to-one matchers written for this benchmark and made as fast as a plain formulation reasonably gets; both run on one thread. `remitmatch` is measured twice, on all 16 threads of the machine (rayon's default) and restricted to one thread (`RAYON_NUM_THREADS=1`). Time is the matching call alone, including the conversion of the answer to groups of ids; peak memory is the whole process. The figures are for a release build of `main` at commit `7ccdca0`, after `0.1.0a2`; the published `0.1.0a2` is slower.
+`remitmatch` was compared with two ways of doing the same job in Python on the same synthetic data: a pure Python baseline (standard library only) and a pandas + rapidfuzz baseline. Both are one-to-one matchers written for this benchmark and made as fast as a plain formulation reasonably gets; both run on one thread. `remitmatch` is measured twice, on all 16 threads of the machine (rayon's default) and restricted to one thread (`RAYON_NUM_THREADS=1`). Time is the matching call alone, including the conversion of the answer to groups of ids; peak memory is the whole process. The figures are for a release build of `main` at commit `f9de1dd`, after `0.1.0a2`; the published `0.1.0a2` is slower.
 
 ![Run time by number of payments for remitmatch on 16 threads and on 1 thread, pure Python and pandas + rapidfuzz, one-to-one dataset, four scopes](https://raw.githubusercontent.com/eamigo86/remitmatch/main/benchmarks/results/time.png)
 
@@ -252,53 +252,53 @@ Four scopes and two currencies (eight partitions), one-to-one data:
 
 | Payments | Implementation | Threads | Time | Peak memory | Precision | Recall | Precision of `auto` matches (count) |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10,000 | remitmatch | 16 | 0.016 s | 175 MB | 100.000 % | 94.81 % | 100.000 % (7,863) |
-| 10,000 | remitmatch | 1 | 0.043 s | 167 MB | 100.000 % | 94.81 % | 100.000 % (7,863) |
-| 10,000 | Pure Python | 1 | 0.031 s | 165 MB | 100.000 % | 94.91 % | n/a |
-| 10,000 | pandas + rapidfuzz | 1 | 0.023 s | 164 MB | 100.000 % | 94.91 % | n/a |
-| 100,000 | remitmatch | 16 | 0.132 s | 413 MB | 100.000 % | 94.79 % | 100.000 % (78,976) |
-| 100,000 | remitmatch | 1 | 0.442 s | 382 MB | 100.000 % | 94.79 % | 100.000 % (78,976) |
-| 100,000 | Pure Python | 1 | 0.360 s | 402 MB | 99.999 % | 94.88 % | n/a |
-| 100,000 | pandas + rapidfuzz | 1 | 0.179 s | 306 MB | 99.999 % | 94.88 % | n/a |
-| 1,000,000 | remitmatch | 16 | 1.445 s | 2,495 MB | 100.000 % | 94.80 % | 100.000 % (790,907) |
-| 1,000,000 | remitmatch | 1 | 5.439 s | 2,251 MB | 100.000 % | 94.80 % | 100.000 % (790,907) |
-| 1,000,000 | Pure Python | 1 | 4.869 s | 2,726 MB | 99.999 % | 94.91 % | n/a |
-| 1,000,000 | pandas + rapidfuzz | 1 | 2.475 s | 1,647 MB | 99.999 % | 94.91 % | n/a |
+| 10,000 | remitmatch | 16 | 0.012 s | 171 MB | 100.000 % | 94.81 % | 100.000 % (7,863) |
+| 10,000 | remitmatch | 1 | 0.021 s | 165 MB | 100.000 % | 94.81 % | 100.000 % (7,863) |
+| 10,000 | Pure Python | 1 | 0.026 s | 168 MB | 100.000 % | 94.91 % | n/a |
+| 10,000 | pandas + rapidfuzz | 1 | 0.022 s | 162 MB | 100.000 % | 94.91 % | n/a |
+| 100,000 | remitmatch | 16 | 0.089 s | 381 MB | 100.000 % | 94.79 % | 100.000 % (78,976) |
+| 100,000 | remitmatch | 1 | 0.208 s | 342 MB | 100.000 % | 94.79 % | 100.000 % (78,976) |
+| 100,000 | Pure Python | 1 | 0.328 s | 403 MB | 99.999 % | 94.88 % | n/a |
+| 100,000 | pandas + rapidfuzz | 1 | 0.171 s | 300 MB | 99.999 % | 94.88 % | n/a |
+| 1,000,000 | remitmatch | 16 | 0.952 s | 2,045 MB | 100.000 % | 94.80 % | 100.000 % (790,907) |
+| 1,000,000 | remitmatch | 1 | 2.636 s | 1,779 MB | 100.000 % | 94.80 % | 100.000 % (790,907) |
+| 1,000,000 | Pure Python | 1 | 4.837 s | 2,718 MB | 99.999 % | 94.91 % | n/a |
+| 1,000,000 | pandas + rapidfuzz | 1 | 2.293 s | 1,670 MB | 99.999 % | 94.91 % | n/a |
 
-On one thread `remitmatch` takes 1.87 to 2.47 times as long as pandas + rapidfuzz and 1.12 to 1.40 times as long as pure Python on this layout. Going from one thread to all threads speeds `remitmatch` up 2.7 to 3.8 times on one-to-one data and 2.8 to 4.8 times on the mixed dataset.
+On one thread `remitmatch` takes 0.96, 1.22 and 1.15 times as long as pandas + rapidfuzz and 0.84, 0.64 and 0.54 times as long as pure Python on this layout. Going from one thread to all threads speeds `remitmatch` up 1.8 to 2.8 times on one-to-one data and 2.4 to 4.2 times on the mixed dataset.
 
 **Recall.** On one-to-one data `remitmatch` finds slightly fewer of the true matches than the baselines: 94.79 to 94.81 % against 94.88 to 94.91 % with four scopes, and 94.07 to 94.34 % against 94.88 to 94.91 % with one scope. Recall stops near 95 % for every implementation because about 9.5 % of all payments carry no invoice number (5 % of the payments that settle an invoice, plus the unrelated ones the generator adds) and cannot be matched by reference.
 
-**Memory.** With all threads `remitmatch` has a higher peak than pandas + rapidfuzz at every size (175 MB against 164 MB at 10,000 payments, 413 MB against 306 MB at 100,000, 2,495 MB against 1,647 MB at 1,000,000). It is higher than pure Python at 10,000 and 100,000 payments and lower at 1,000,000 (2,495 MB against 2,726 MB).
+**Memory.** With all threads `remitmatch` has a higher peak than pandas + rapidfuzz at every size (171 MB against 162 MB at 10,000 payments, 381 MB against 300 MB at 100,000, 2,045 MB against 1,670 MB at 1,000,000). It is higher than pure Python at 10,000 payments and lower at 100,000 and 1,000,000 (2,045 MB against 2,718 MB).
 
-**Grouped and partial payments.** The baselines cannot match a payment to several invoices or several payments to one invoice. On the `mixed` dataset, which contains both, `remitmatch` finds 93.88 to 94.90 % of the true groups with four scopes and the baselines 88.10 to 88.45 %, with precision of 99.9 % or better for all three. On that dataset `remitmatch` on all threads is 1.26, 0.93 and 1.05 times as fast as pandas + rapidfuzz at the three sizes, so about equal at 100,000 and 1,000,000 payments.
+**Grouped and partial payments.** The baselines cannot match a payment to several invoices or several payments to one invoice. On the `mixed` dataset, which contains both, `remitmatch` finds 93.88 to 94.90 % of the true groups with four scopes and the baselines 88.10 to 88.45 %, with precision of 99.9 % or better for all three. On that dataset `remitmatch` on all threads is 1.58, 1.11 and 1.61 times as fast as pandas + rapidfuzz at the three sizes.
 
-**One large scope.** With one scope and one currency there is one partition, so the threads have nothing to share: `remitmatch` on all threads and on one thread differ by 1.01 to 1.05 times. One-to-one data:
+**One large scope.** With one scope and one currency there is one partition, so less of the work can be shared between threads: `remitmatch` on all threads is 1.43 to 1.84 times as fast as on one thread on one-to-one data (four scopes: 1.80 to 2.77). One-to-one data, where it is 1.40, 1.00 and 1.12 times as fast as pandas + rapidfuzz on all threads:
 
 | Payments | Implementation | Threads | Time | Peak memory | Precision | Recall | Precision of `auto` matches (count) |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10,000 | remitmatch | 16 | 0.042 s | 174 MB | 100.000 % | 94.34 % | 100.000 % (7,829) |
-| 10,000 | remitmatch | 1 | 0.043 s | 172 MB | 100.000 % | 94.34 % | 100.000 % (7,829) |
-| 10,000 | Pure Python | 1 | 0.027 s | 166 MB | 100.000 % | 94.91 % | n/a |
-| 10,000 | pandas + rapidfuzz | 1 | 0.023 s | 163 MB | 100.000 % | 94.91 % | n/a |
-| 100,000 | remitmatch | 16 | 0.516 s | 387 MB | 100.000 % | 94.19 % | 100.000 % (78,541) |
-| 100,000 | remitmatch | 1 | 0.537 s | 386 MB | 100.000 % | 94.19 % | 100.000 % (78,541) |
-| 100,000 | Pure Python | 1 | 0.368 s | 403 MB | 99.997 % | 94.88 % | n/a |
-| 100,000 | pandas + rapidfuzz | 1 | 0.181 s | 302 MB | 99.997 % | 94.88 % | n/a |
-| 1,000,000 | remitmatch | 16 | 8.030 s | 2,461 MB | 100.000 % | 94.07 % | 100.000 % (785,637) |
-| 1,000,000 | remitmatch | 1 | 8.363 s | 2,455 MB | 100.000 % | 94.07 % | 100.000 % (785,637) |
-| 1,000,000 | Pure Python | 1 | 6.540 s | 2,721 MB | 99.990 % | 94.90 % | n/a |
-| 1,000,000 | pandas + rapidfuzz | 1 | 2.502 s | 1,701 MB | 99.989 % | 94.90 % | n/a |
+| 10,000 | remitmatch | 16 | 0.017 s | 172 MB | 100.000 % | 94.34 % | 100.000 % (7,829) |
+| 10,000 | remitmatch | 1 | 0.025 s | 167 MB | 100.000 % | 94.34 % | 100.000 % (7,829) |
+| 10,000 | Pure Python | 1 | 0.029 s | 168 MB | 100.000 % | 94.91 % | n/a |
+| 10,000 | pandas + rapidfuzz | 1 | 0.024 s | 162 MB | 100.000 % | 94.91 % | n/a |
+| 100,000 | remitmatch | 16 | 0.189 s | 355 MB | 100.000 % | 94.19 % | 100.000 % (78,541) |
+| 100,000 | remitmatch | 1 | 0.302 s | 353 MB | 100.000 % | 94.19 % | 100.000 % (78,541) |
+| 100,000 | Pure Python | 1 | 0.417 s | 408 MB | 99.997 % | 94.88 % | n/a |
+| 100,000 | pandas + rapidfuzz | 1 | 0.189 s | 305 MB | 99.997 % | 94.88 % | n/a |
+| 1,000,000 | remitmatch | 16 | 2.205 s | 2,064 MB | 100.000 % | 94.07 % | 100.000 % (785,637) |
+| 1,000,000 | remitmatch | 1 | 4.050 s | 2,023 MB | 100.000 % | 94.07 % | 100.000 % (785,637) |
+| 1,000,000 | Pure Python | 1 | 6.842 s | 2,720 MB | 99.990 % | 94.90 % | n/a |
+| 1,000,000 | pandas + rapidfuzz | 1 | 2.462 s | 1,701 MB | 99.989 % | 94.90 % | n/a |
 
-On the `mixed` dataset with one scope the times at 1,000,000 payments are 20.167 s for `remitmatch` (all threads), 13.126 s for pure Python and 2.625 s for pandas + rapidfuzz, and `remitmatch` still finds more of the true groups (93.08 % against 88.43 %). The full tables, with build times, memory after loading and every run, are in [`benchmarks/README.md`](https://github.com/eamigo86/remitmatch/blob/main/benchmarks/README.md).
+On the `mixed` dataset with one scope the times at 1,000,000 payments are 7.267 s for `remitmatch` (all threads), 14.411 s for pure Python and 2.585 s for pandas + rapidfuzz, so `remitmatch` is 2.8 times slower than pandas + rapidfuzz there, with higher recall (93.08 % against 88.43 %); it is 2.55 and 2.82 times slower at 10,000 and 100,000 payments. The full tables, with build times, memory after loading and every run, are in [`benchmarks/README.md`](https://github.com/eamigo86/remitmatch/blob/main/benchmarks/README.md).
 
 Read the numbers with these caveats:
 
 - The data is synthetic, from a generator that mirrors the noise model of the accuracy tests. The default weights have not been tuned. Precision here says nothing about real bank statements.
 - About 9.5 % of all payments carry no invoice number; in the rest it appears in one of a few formats, which makes an exact dictionary lookup very effective.
 - The baselines hardcode the `INV` prefix of the invoice numbers; `remitmatch` does not need to know it. With any other prefix the baselines find nothing. In an exploratory measurement, not in the results file, a regular expression that accepts any three letters as a prefix made pure Python about 36 % slower and pandas + rapidfuzz about 3 % slower at 100,000 payments, with no measurable difference at 1,000,000.
-- One machine (Apple M3 Max, 16 threads, 128 GB, macOS, Python 3.14), heavily shared with other work: the load average was between 9 and 14 on 16 threads while the benchmark ran. The effect on the 16-thread `remitmatch` and on the single-threaded baselines was not measured. Best of 3 runs up to 100,000 payments and a single run at 1,000,000. The garbage collector was off during every timed call.
-- Build: release build of `main` at commit `7ccdca0`, after `0.1.0a2`.
+- One machine (Apple M3 Max, 16 threads, 128 GB, macOS, Python 3.14), heavily shared with other work: the load average was between 7 and 15 on 16 threads while the benchmark ran. The effect on the 16-thread `remitmatch` and on the single-threaded baselines was not measured. Best of 3 runs up to 100,000 payments and a single run at 1,000,000. The garbage collector was off during every timed call.
+- Build: release build of `main` at commit `f9de1dd`, after `0.1.0a2`.
 - reconPy, which the RFC mentions, is not included: it only takes a percentage tolerance and joins on exact columns, so it cannot express "within 300 minor units" and would build every pair within a scope. See [`benchmarks/README.md`](https://github.com/eamigo86/remitmatch/blob/main/benchmarks/README.md).
 
 To reproduce: `uv sync --group bench`, `uv run --no-sync maturin develop --release`, then `uv run --no-sync python benchmarks/run.py --remitmatch-build release --commit "$(git rev-parse --short HEAD)"`. The details are in `benchmarks/README.md`.
