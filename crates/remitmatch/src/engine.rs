@@ -155,6 +155,8 @@ struct Engine<'a> {
     /// Whether a candidate with no reference signal can neither be accepted nor make another
     /// candidate of its anchor ambiguous; see [`cannot_matter`].
     skip_unnamed: bool,
+    /// The smallest score that reaches the suggest threshold; see [`least_accepted`].
+    least_accepted: f64,
 }
 
 /// Normalized counterparty names of one side, stored once per distinct text.
@@ -496,6 +498,7 @@ fn reconcile_validated(
         payment_reference,
         payment_name,
         skip_unnamed: cannot_matter(&Weights::from_map(&config.weights), config, 0.0),
+        least_accepted: least_accepted(config.suggest_threshold),
     };
     let partitions = partitions(invoices, payments);
     let partitions: Vec<&PartitionRows> = partitions.values().collect();
@@ -537,11 +540,10 @@ fn reconcile_validated(
 
 /// Returns whether a candidate whose reference signal is at most `reference` can be ignored.
 ///
-/// Its score is at most the one with the other three signals at 1. When that bound is below
-/// the suggest threshold by at least the ambiguity margin (and also fails the acceptance
-/// test, which matters for a margin of 0), the candidate cannot be accepted. It cannot make
-/// an accepted candidate of its anchor ambiguous either, because that needs a score within
-/// the margin of the accepted one, which scores at least the threshold.
+/// Its score is at most the one with the other three signals at 1. When that bound is
+/// [`ignorable`], the candidate cannot be accepted, and it cannot make an accepted candidate
+/// of its anchor ambiguous either, because that needs a score within the margin of the
+/// accepted one.
 fn cannot_matter(weights: &Weights, config: &MatchConfig, reference: f64) -> bool {
     let best = Signals {
         reference,
@@ -550,8 +552,37 @@ fn cannot_matter(weights: &Weights, config: &MatchConfig, reference: f64) -> boo
         date: 1.0,
     };
     let bound = weighted_score(&best, weights);
-    bound <= config.suggest_threshold - config.ambiguity_margin
-        && !meets(bound, config.suggest_threshold)
+    ignorable(bound, config, least_accepted(config.suggest_threshold))
+}
+
+/// Returns the smallest score that reaches `threshold` under [`meets`].
+///
+/// Scores are never negative, so the answer is 0 when a score of 0 already reaches the
+/// threshold. `threshold` must be between 0 and 1, which validation guarantees.
+fn least_accepted(threshold: f64) -> f64 {
+    // Non-negative floats order like their bit patterns, and `meets` never turns false as
+    // the score grows, so a binary search over the bits finds the first score that passes.
+    let (mut low, mut high) = (0.0_f64.to_bits(), threshold.to_bits());
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if meets(f64::from_bits(middle), threshold) {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    f64::from_bits(high)
+}
+
+/// Returns whether a 1:1 candidate that scores at most `score` can be ignored.
+///
+/// `least` is the smallest accepted score, from [`least_accepted`]. The candidate is ignored
+/// when it fails the acceptance test and also the ambiguity test against `least`, written
+/// here exactly as the assignment evaluates it. Both tests only get harder to pass as the
+/// accepted score rises or this one falls, so the answer holds for every accepted candidate
+/// and for every score below `score`, with no rounding case left over.
+fn ignorable(score: f64, config: &MatchConfig, least: f64) -> bool {
+    !meets(score, config.suggest_threshold) && least - score + EPS >= config.ambiguity_margin
 }
 
 /// The process that first ran `reconcile`, which is the one that owns the thread pool.
@@ -836,10 +867,10 @@ impl Engine<'_> {
     /// Scores the 1:1 candidate of payment `p` and invoice `i`, or returns `None` when it
     /// cannot matter.
     ///
-    /// A candidate whose score satisfies the test of [`cannot_matter`] can neither be accepted
-    /// (it is below the suggest threshold) nor make an accepted candidate of its anchor
-    /// ambiguous (that needs a second best within the margin of a first that scores at least
-    /// the threshold), so it is not materialized. This holds for single candidates only:
+    /// A candidate whose score is [`ignorable`] can neither be accepted (it is below the
+    /// suggest threshold) nor make an accepted candidate of its anchor ambiguous (that needs
+    /// a second best within the margin of a first that is accepted), so it is not
+    /// materialized. This holds for single candidates only:
     /// the group rule counts every fitting group of an anchor, whatever its score.
     fn single_candidate(&self, p: usize, i: usize, reference: f64) -> Option<Candidate> {
         let candidate = self.candidate(
@@ -849,10 +880,7 @@ impl Engine<'_> {
             reference,
             false,
         );
-        let config = self.config;
-        let ignorable = candidate.score <= config.suggest_threshold - config.ambiguity_margin
-            && !meets(candidate.score, config.suggest_threshold);
-        (!ignorable).then_some(candidate)
+        (!ignorable(candidate.score, self.config, self.least_accepted)).then_some(candidate)
     }
 
     /// Returns the subsets of `rows` whose amounts add up to `target` within the tolerance.
@@ -1851,6 +1879,61 @@ mod tests {
         };
         let weights = Weights::from_map(&config.weights);
         assert!(!cannot_matter(&weights, &config, 0.0));
+    }
+
+    /// Thresholds and margins in steps of 0.01, where the pruning boundary is easy to hit.
+    fn boundary_configs() -> impl Iterator<Item = MatchConfig> {
+        (20..=95_u32).flat_map(|t| {
+            (0..=20_u32).map(move |m| MatchConfig {
+                suggest_threshold: f64::from(t) / 100.0,
+                auto_threshold: 1.0,
+                ambiguity_margin: f64::from(m) / 100.0,
+                ..MatchConfig::default()
+            })
+        })
+    }
+
+    #[test]
+    fn the_least_accepted_score_is_the_first_that_meets_the_threshold() {
+        // Thresholds at and around `EPS` are met by a score of 0, the lowest there is.
+        let tiny = [0.0, 1e-300, EPS / 2.0, EPS, EPS.next_up(), 2.0 * EPS, 1.0];
+        let grid = boundary_configs().map(|config| config.suggest_threshold);
+        for threshold in tiny.into_iter().chain(grid) {
+            let least = least_accepted(threshold);
+            assert!(meets(least, threshold), "threshold {threshold}");
+            assert!(
+                least == 0.0 || !meets(least.next_down(), threshold),
+                "threshold {threshold}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ignored_score_never_passes_the_ambiguity_test_of_an_accepted_one() {
+        for config in boundary_configs() {
+            let least = least_accepted(config.suggest_threshold);
+            let edge = config.suggest_threshold - config.ambiguity_margin;
+            let scores = [
+                edge.next_down(),
+                edge,
+                edge.next_up(),
+                edge - EPS,
+                edge + EPS,
+            ];
+            for score in scores {
+                // The test the assignment applies to the best two scores of an anchor.
+                let ambiguous = least - score + EPS < config.ambiguity_margin;
+                assert!(
+                    !(ignorable(score, &config, least) && ambiguous),
+                    "threshold {}, margin {}, score {score}",
+                    config.suggest_threshold,
+                    config.ambiguity_margin,
+                );
+                assert!(
+                    !(ignorable(score, &config, least) && meets(score, config.suggest_threshold))
+                );
+            }
+        }
     }
 
     /// Builds one scope and one currency with `n` invoices and about as many payments: named,
