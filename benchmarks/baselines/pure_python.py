@@ -29,7 +29,15 @@ from difflib import SequenceMatcher
 from generate import Group, Invoice, Payment
 
 _DROP = str.maketrans("", "", " -/")
-_TOKEN = re.compile(r"INV\d+")
+INVOICE_PREFIX = "INV"
+"""Prefix of the invoice numbers this baseline looks for in the references.
+
+The choice favours the baseline: knowing the prefix turns the exact pass into one regular
+expression. Invoice numbers with any other prefix are never found, so on such data the
+baseline matches nothing (remitmatch does not need to know the prefix). A prefix-agnostic
+pattern costs time.
+"""
+_TOKEN = re.compile(rf"{INVOICE_PREFIX}\d+")
 _SUFFIXES = frozenset({"SL", "SA", "LLC", "INC", "GMBH", "LTD"})
 _WINDOW_DAYS = 30
 _FULL_DATE_SCORE_DAYS = 3
