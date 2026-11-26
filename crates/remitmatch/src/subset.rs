@@ -22,6 +22,10 @@ pub(crate) fn find_subsets(
     limit: usize,
 ) -> Vec<Vec<usize>> {
     let pool = &amounts[..amounts.len().min(GROUP_CANDIDATE_LIMIT)];
+    if pool.len() < 2 {
+        // A subset has at least two amounts, and most pools hold one.
+        return Vec::new();
+    }
     let (left, right) = pool.split_at(pool.len() / 2);
     let left_subsets = subsets_of(left, max_size);
     let mut right_subsets = subsets_of(right, max_size);
