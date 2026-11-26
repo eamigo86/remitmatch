@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aho_corasick::{AhoCorasick, MatchKind as AcMatchKind};
-use chrono::NaiveDate;
+use chrono::{Days, NaiveDate};
 use rayon::prelude::*;
 
 use crate::normalize::{Reference, normalize_name, normalize_reference};
@@ -847,7 +847,12 @@ impl Engine<'_> {
         mentions: &Mentions,
         state: &mut Assigned<'_>,
     ) {
-        let invoices = by_name(invoice_rows, |r| state.invoice_taken(r), &self.invoice_name);
+        let invoices = by_name(
+            invoice_rows,
+            |r| state.invoice_taken(r),
+            &self.invoice_name,
+            |i| self.invoices[i].due_date,
+        );
         let payments = oldest(
             payment_rows
                 .iter()
@@ -871,12 +876,17 @@ impl Engine<'_> {
             let pool = similar
                 .get(self.payment_name.get(p))
                 .iter()
-                .flat_map(|rows| rows.iter().copied())
+                .flat_map(|rows| {
+                    let near = within_days(
+                        rows,
+                        |i| self.invoices[i].due_date,
+                        pay.value_date,
+                        self.config.date_window_days,
+                    );
+                    near.iter().copied()
+                })
                 .filter(|&i| {
-                    let inv = &self.invoices[i];
-                    !state.invoice_taken(i)
-                        && i128::from(inv.amount_minor) <= limit
-                        && self.within_window(pay.value_date, inv.due_date)
+                    !state.invoice_taken(i) && i128::from(self.invoices[i].amount_minor) <= limit
                 })
                 .collect();
             let pool = oldest(pool, |i| self.invoices[i].due_date);
@@ -909,7 +919,12 @@ impl Engine<'_> {
         mentions: &Mentions,
         state: &mut Assigned<'_>,
     ) {
-        let payments = by_name(payment_rows, |r| state.payment_taken(r), &self.payment_name);
+        let payments = by_name(
+            payment_rows,
+            |r| state.payment_taken(r),
+            &self.payment_name,
+            |p| self.payments[p].value_date,
+        );
         let invoices = oldest(
             invoice_rows
                 .iter()
@@ -931,12 +946,17 @@ impl Engine<'_> {
             let pool = similar
                 .get(self.invoice_name.get(i))
                 .iter()
-                .flat_map(|rows| rows.iter().copied())
+                .flat_map(|rows| {
+                    let near = within_days(
+                        rows,
+                        |p| self.payments[p].value_date,
+                        inv.due_date,
+                        self.config.date_window_days,
+                    );
+                    near.iter().copied()
+                })
                 .filter(|&p| {
-                    let pay = &self.payments[p];
-                    !state.payment_taken(p)
-                        && i128::from(pay.amount_minor) <= limit
-                        && self.within_window(pay.value_date, inv.due_date)
+                    !state.payment_taken(p) && i128::from(self.payments[p].amount_minor) <= limit
                 })
                 .collect();
             let pool = oldest(pool, |p| self.payments[p].value_date);
@@ -1055,17 +1075,41 @@ impl Engine<'_> {
     }
 }
 
-/// Buckets the free rows by normalized name, keeping input order inside each bucket.
+/// Buckets the free rows by normalized name, each bucket sorted by date and then input index,
+/// so [`within_days`] can cut the date window out of it.
 fn by_name<'a>(
     rows: &[usize],
     taken: impl Fn(usize) -> bool,
     names: &'a Names,
+    date: impl Fn(usize) -> NaiveDate,
 ) -> BTreeMap<&'a str, Vec<usize>> {
     let mut buckets: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for &row in rows.iter().filter(|&&r| !taken(r)) {
         buckets.entry(names.get(row)).or_default().push(row);
     }
+    for bucket in buckets.values_mut() {
+        bucket.sort_unstable_by_key(|&r| (date(r), r));
+    }
     buckets
+}
+
+/// Returns the rows whose date is at most `days` days from `center`, as a slice of `rows`,
+/// which must be sorted by date.
+fn within_days(
+    rows: &[usize],
+    date: impl Fn(usize) -> NaiveDate,
+    center: NaiveDate,
+    days: u32,
+) -> &[usize] {
+    let low = center
+        .checked_sub_days(Days::new(days.into()))
+        .unwrap_or(NaiveDate::MIN);
+    let high = center
+        .checked_add_days(Days::new(days.into()))
+        .unwrap_or(NaiveDate::MAX);
+    let start = rows.partition_point(|&r| date(r) < low);
+    let end = rows.partition_point(|&r| date(r) <= high);
+    &rows[start..end]
 }
 
 /// Finds, for each distinct anchor name, the buckets whose name reaches the threshold.
@@ -1265,6 +1309,44 @@ mod tests {
         for _ in 0..2 {
             assert_eq!(cached.get(1, 1, || 0.0), 0.0);
         }
+    }
+
+    #[test]
+    fn within_days_returns_exactly_the_rows_inside_the_window() {
+        let day =
+            |d: i64| NaiveDate::from_ymd_opt(2024, 3, 1).unwrap() + chrono::Days::new(d as u64);
+        let dates: Vec<NaiveDate> = [0, 1, 1, 5, 9, 10, 10, 11, 30].map(day).to_vec();
+        let rows: Vec<usize> = (0..dates.len()).collect();
+        for center in [day(0), day(10), day(30), day(100)] {
+            for window in [0, 1, 5, 10, 365] {
+                let expected: Vec<usize> = rows
+                    .iter()
+                    .copied()
+                    .filter(|&r| {
+                        center
+                            .signed_duration_since(dates[r])
+                            .num_days()
+                            .unsigned_abs()
+                            <= u64::from(window)
+                    })
+                    .collect();
+                assert_eq!(
+                    within_days(&rows, |r| dates[r], center, window),
+                    expected,
+                    "center {center} window {window}"
+                );
+            }
+        }
+        let first = [NaiveDate::MIN];
+        assert_eq!(
+            within_days(&[0], |r| first[r], NaiveDate::MIN, u32::MAX),
+            [0]
+        );
+        let last = [NaiveDate::MAX];
+        assert_eq!(
+            within_days(&[0], |r| last[r], NaiveDate::MAX, u32::MAX),
+            [0]
+        );
     }
 
     #[test]
