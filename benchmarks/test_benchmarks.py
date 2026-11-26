@@ -366,13 +366,14 @@ def test_runner_measures_every_implementation(tmp_path: Path) -> None:
     Args:
         tmp_path: Directory for the results file.
     """
-    data = _small_run(tmp_path, "--runs", "2", "--remitmatch-build", "test")
+    data = _small_run(tmp_path, "--runs", "2", "--remitmatch-build", "test", "--commit", "abc1234")
     meta = data["meta"]
     assert meta["sizes"] == [2000]
     assert meta["scopes"] == 4
     assert meta["seed"] == 1
     assert meta["machine"]["cpu_count"] >= 1
     assert meta["packages"]["remitmatch"]["build"] == "test"
+    assert meta["packages"]["remitmatch"]["commit"] == "abc1234"
     assert {r["implementation"] for r in data["results"]} == {
         "remitmatch",
         "pure-python",
