@@ -94,6 +94,8 @@ struct Engine<'a> {
     invoice_number_counts: Vec<LazyCounts>,
     /// Cache of the name similarity of each pair of distinct names.
     name_scores: NameScores,
+    /// Whether this process may use the thread pool; a forked child may not.
+    parallel: bool,
     /// Whether a candidate with no reference signal can neither be accepted nor make another
     /// candidate of its anchor ambiguous; see [`cannot_matter`].
     skip_unnamed: bool,
@@ -361,10 +363,51 @@ fn map_rows<T: Sync, U: Send>(
     f: impl Fn(&T) -> U + Sync + Send,
 ) -> Vec<U> {
     if parallel {
-        rows.par_iter().map(f).collect()
+        rows.par_iter()
+            .with_min_len(PARALLEL_GRAIN)
+            .map(f)
+            .collect()
     } else {
         rows.iter().map(f).collect()
     }
+}
+
+/// Rows per task below which a parallel section is not split further.
+// ponytail: a fixed grain; small partitions run as one task. Upgrade: tune it from the cost
+// of a row if some pass has rows that are far heavier than a candidate scan.
+const PARALLEL_GRAIN: usize = 256;
+
+/// Applies `f` to consecutive chunks of `rows` and returns the results in row order; the
+/// chunks run on the thread pool only when `parallel` is set.
+///
+/// One result per chunk, not per row, keeps the number of small allocations down.
+fn map_chunks<T: Sync, U: Send>(
+    rows: &[T],
+    parallel: bool,
+    f: impl Fn(&[T]) -> U + Sync + Send,
+) -> Vec<U> {
+    if parallel {
+        rows.par_chunks(PARALLEL_GRAIN).map(f).collect()
+    } else {
+        rows.chunks(PARALLEL_GRAIN).map(f).collect()
+    }
+}
+
+/// Maps every row to a list and joins the lists in row order; the rows run on the thread
+/// pool only when `parallel` is set.
+fn flat_map_rows<T: Sync, U: Send>(
+    rows: &[T],
+    parallel: bool,
+    f: impl Fn(&T) -> Vec<U> + Sync + Send,
+) -> Vec<U> {
+    let parts = map_chunks(rows, parallel, |chunk| {
+        chunk.iter().flat_map(&f).collect::<Vec<U>>()
+    });
+    let mut joined = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+    for part in parts {
+        joined.extend(part);
+    }
+    joined
 }
 
 /// Runs the engine on validated input, with the per-row setup and the partitions on the
@@ -380,6 +423,7 @@ fn reconcile_validated(
     let invoice_name = Names::new(invoices, parallel, |i| i.counterparty.as_str());
     let payment_name = Names::new(payments, parallel, |p| p.counterparty.as_str());
     let engine = Engine {
+        parallel,
         name_scores: NameScores::new(
             payment_name.distinct.len(),
             invoice_name.distinct.len(),
@@ -638,11 +682,13 @@ impl Engine<'_> {
             .map(|&i| (self.invoices[i].amount_minor, i))
             .collect();
         open.sort_unstable();
-        let candidates = payment_rows
-            .iter()
-            .filter(|&&p| !state.payment_taken(p))
-            .flat_map(|&p| self.window_candidates(p, &open, mentions.contains_key(&p)))
-            .collect();
+        let candidates = flat_map_rows(payment_rows, self.parallel, |&p| {
+            if state.payment_taken(p) {
+                Vec::new()
+            } else {
+                self.window_candidates(p, &open, mentions.contains_key(&p))
+            }
+        });
         self.assign(candidates, state);
 
         self.match_invoice_groups_by_name(invoice_rows, payment_rows, &mentions, state);
@@ -813,46 +859,70 @@ impl Engine<'_> {
             return Ok((candidates, all_mentions));
         }
         let index = NumberIndex::new(by_number, HASHED_LENGTHS_MAX)?;
-        for &p in payment_rows {
-            let reference = &self.payment_reference[p];
-            let mut mentioned = BTreeSet::new();
-            index.find(&reference.text, |start, end, rows| {
-                if is_mention(reference, start, end) {
-                    mentioned.extend(rows.iter().copied());
-                }
-            });
-            if mentioned.is_empty() {
-                continue;
-            }
-            for &i in &mentioned {
-                let diff = self.payments[p]
-                    .amount_minor
-                    .abs_diff(self.invoices[i].amount_minor);
-                if diff <= self.tolerance {
-                    candidates.extend(self.single_candidate(p, i, 1.0));
+        // The scan and the candidates of a payment read nothing that another payment writes, so
+        // chunks of payments run side by side and their results are joined in payment order.
+        let parts = map_chunks(payment_rows, self.parallel, |chunk| {
+            let mut found = Vec::new();
+            let mut mentions = Vec::new();
+            for &p in chunk {
+                if let Some((mentioned, mut own)) = self.payment_mentions(&index, p) {
+                    found.append(&mut own);
+                    mentions.push((p, mentioned));
                 }
             }
-            let pool = oldest(mentioned.iter().copied().collect(), |i| {
-                self.invoices[i].due_date
-            });
-            let (groups, truncated) = self.fitting_groups(
-                &pool,
-                |i| self.invoices[i].amount_minor,
-                self.payments[p].amount_minor,
-            );
-            for group in groups {
-                let c = self.candidate(
-                    Anchor::Payment(p),
-                    Members::One(p),
-                    Members::Many(group),
-                    1.0,
-                    truncated,
-                );
-                candidates.push(c);
-            }
-            all_mentions.insert(p, mentioned);
+            (found, mentions)
+        });
+        for (found, mentions) in parts {
+            candidates.extend(found);
+            all_mentions.extend(mentions);
         }
         Ok((candidates, all_mentions))
+    }
+
+    /// Returns the invoices payment `p` mentions exactly and the candidates anchored at it,
+    /// or `None` when it mentions no invoice.
+    fn payment_mentions(
+        &self,
+        index: &NumberIndex<'_>,
+        p: usize,
+    ) -> Option<(BTreeSet<usize>, Vec<Candidate>)> {
+        let reference = &self.payment_reference[p];
+        let mut mentioned = BTreeSet::new();
+        index.find(&reference.text, |start, end, rows| {
+            if is_mention(reference, start, end) {
+                mentioned.extend(rows.iter().copied());
+            }
+        });
+        if mentioned.is_empty() {
+            return None;
+        }
+        let mut candidates = Vec::new();
+        for &i in &mentioned {
+            let diff = self.payments[p]
+                .amount_minor
+                .abs_diff(self.invoices[i].amount_minor);
+            if diff <= self.tolerance {
+                candidates.extend(self.single_candidate(p, i, 1.0));
+            }
+        }
+        let pool = oldest(mentioned.iter().copied().collect(), |i| {
+            self.invoices[i].due_date
+        });
+        let (groups, truncated) = self.fitting_groups(
+            &pool,
+            |i| self.invoices[i].amount_minor,
+            self.payments[p].amount_minor,
+        );
+        for group in groups {
+            candidates.push(self.candidate(
+                Anchor::Payment(p),
+                Members::One(p),
+                Members::Many(group),
+                1.0,
+                truncated,
+            ));
+        }
+        Some((mentioned, candidates))
     }
 
     /// Builds the N:1 candidates anchored at each open invoice that open payments name.
@@ -1314,6 +1384,23 @@ mod tests {
     }
 
     #[test]
+    fn flat_map_rows_joins_the_lists_in_row_order_in_both_modes() {
+        let rows: Vec<usize> = (0..3_000).collect();
+        // Rows of every length, including none.
+        let lists = |n: &usize| (0..n % 4).map(|k| n * 10 + k).collect::<Vec<usize>>();
+        let expected: Vec<usize> = rows.iter().flat_map(lists).collect();
+        assert!(expected.len() > 4_000);
+        assert_eq!(flat_map_rows(&rows, true, lists), expected);
+        assert_eq!(flat_map_rows(&rows, false, lists), expected);
+        // The pool is used only when asked for.
+        let on_worker = |parallel: bool| {
+            flat_map_rows(&rows, parallel, |_| vec![rayon::current_thread_index()])
+        };
+        assert!(on_worker(false).iter().all(Option::is_none));
+        assert!(on_worker(true).iter().all(Option::is_some));
+    }
+
+    #[test]
     fn map_rows_leaves_the_thread_pool_alone_unless_asked() {
         // The test thread is not a pool worker, so a parallel call hands every row to a
         // worker and a sequential call keeps every row here.
@@ -1662,6 +1749,65 @@ mod tests {
         };
         let weights = Weights::from_map(&config.weights);
         assert!(!cannot_matter(&weights, &config, 0.0));
+    }
+
+    /// Builds one scope and one currency with `n` invoices and about as many payments: named,
+    /// misspelled and unnamed references, repeated amounts, groups and partial payments.
+    fn one_large_partition(n: usize) -> (Vec<Invoice>, Vec<Payment>) {
+        let day = |d: u64| NaiveDate::from_ymd_opt(2024, 1, 1).unwrap() + chrono::Days::new(d);
+        let names = ["Acme S.L.", "ACME", "Beta Corp", "Gamma GmbH", "Delta Inc."];
+        let invoices = (0..n)
+            .map(|k| Invoice {
+                id: format!("i{k}"),
+                number: format!("INV-{:05}", k * 7 % n),
+                amount_minor: 1_000 + 37 * (k as i64 % 23),
+                currency: "EUR".to_owned(),
+                issue_date: day(0),
+                due_date: day(10 + (k as u64 % 40)),
+                counterparty: names[k % names.len()].to_owned(),
+                scope: "one".to_owned(),
+            })
+            .collect();
+        let payments = (0..n)
+            .map(|k| Payment {
+                id: format!("p{k}"),
+                amount_minor: 1_000 + 37 * (k as i64 % 23) + if k % 11 == 0 { 37 } else { 0 },
+                currency: "EUR".to_owned(),
+                value_date: day(12 + (k as u64 % 35)),
+                reference: match k % 4 {
+                    0 => format!("pago INV-{:05}", k * 7 % n),
+                    1 => format!("pago INV-{:05} y INV-{:05}", k * 7 % n, (k + 1) * 7 % n),
+                    2 => format!("pago INV-{:05}", (k * 7 % n + 1) % n),
+                    _ => "thanks".to_owned(),
+                },
+                counterparty: names[(k + 1) % names.len()].to_uppercase(),
+                scope: "one".to_owned(),
+            })
+            .collect();
+        (invoices, payments)
+    }
+
+    #[test]
+    fn one_large_partition_gives_the_same_result_whatever_the_threads() {
+        let (invoices, payments) = one_large_partition(3_000);
+        let config = MatchConfig {
+            amount_tolerance_minor: 40,
+            suggest_threshold: 0.3,
+            ..MatchConfig::default()
+        };
+        let sequential = reconcile_validated(&invoices, &payments, &config, false).unwrap();
+        assert!(
+            sequential.matches.len() > 1_000,
+            "the data must produce matches"
+        );
+        for threads in [1, 8, 32] {
+            let run = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| reconcile_validated(&invoices, &payments, &config, true).unwrap());
+            assert_eq!(run, sequential, "{threads} threads");
+        }
     }
 
     #[test]
