@@ -1,7 +1,7 @@
 //! The matching engine: validation, partitioning, the reference passes, the 1:1 candidate
 //! pass, group search and greedy assignment.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -9,6 +9,7 @@ use aho_corasick::{AhoCorasick, MatchKind as AcMatchKind};
 use chrono::{Days, NaiveDate};
 use rayon::prelude::*;
 
+use crate::fasthash::{FastMap, FastSet};
 use crate::normalize::{Reference, normalize_name, normalize_reference};
 use crate::score::{
     EPS, LazyCounts, Signals, Weights, amount_signal, breakdown, date_signal,
@@ -29,7 +30,7 @@ type PartitionRows = (Vec<usize>, Vec<usize>);
 const GROUP_NAME_THRESHOLD: f64 = 0.85;
 
 /// Invoices each payment of a partition mentions exactly, by input index.
-type Mentions = HashMap<usize, BTreeSet<usize>>;
+type Mentions = FastMap<usize, BTreeSet<usize>>;
 
 /// The row a candidate search starts from; ambiguity is judged per anchor.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -111,11 +112,11 @@ impl Names {
     fn new<T: Sync>(rows: &[T], parallel: bool, text: impl Fn(&T) -> &str + Sync + Send) -> Self {
         let mut raw: Vec<&str> = if parallel {
             rows.par_iter()
-                .fold(HashSet::new, |mut seen, row| {
+                .fold(FastSet::default, |mut seen, row| {
                     seen.insert(text(row));
                     seen
                 })
-                .reduce(HashSet::new, |mut all, seen| {
+                .reduce(FastSet::default, |mut all, seen| {
                     all.extend(seen);
                     all
                 })
@@ -124,17 +125,17 @@ impl Names {
         } else {
             rows.iter()
                 .map(&text)
-                .collect::<HashSet<_>>()
+                .collect::<FastSet<_>>()
                 .into_iter()
                 .collect()
         };
         // Sorted, so the layout does not depend on how the threads were scheduled.
         raw.sort_unstable();
-        let position: HashMap<&str, usize> = raw.iter().enumerate().map(|(k, &t)| (t, k)).collect();
+        let position: FastMap<&str, usize> = raw.iter().enumerate().map(|(k, &t)| (t, k)).collect();
         let normalized = map_rows(&raw, parallel, |&t| normalize_name(t));
         // Different raw texts often normalize to the same name ("Acme S.L." and "ACME").
         let mut distinct: Vec<String> = Vec::new();
-        let mut known: HashMap<&str, usize> = HashMap::new();
+        let mut known: FastMap<&str, usize> = FastMap::default();
         let name_of_raw: Vec<usize> = normalized
             .iter()
             .map(|name| {
@@ -390,7 +391,7 @@ fn unmatched<'a>(ids: impl Iterator<Item = &'a String>, taken: &[AtomicBool]) ->
 /// Rejects duplicate ids and out-of-range configuration.
 fn validate(invoices: &[Invoice], payments: &[Payment], config: &MatchConfig) -> Result<(), Error> {
     validate_config(config)?;
-    let mut seen = HashSet::with_capacity(invoices.len());
+    let mut seen = FastSet::with_capacity_and_hasher(invoices.len(), Default::default());
     for invoice in invoices {
         if !seen.insert(invoice.id.as_str()) {
             return Err(Error::DuplicateInvoiceId(invoice.id.clone()));
@@ -469,7 +470,7 @@ fn partitions<'a>(
     payments: &'a [Payment],
 ) -> BTreeMap<(&'a str, String), PartitionRows> {
     // Rows are first grouped by the raw pair, which costs no allocation per row.
-    let mut raw: HashMap<(&'a str, &'a str), PartitionRows> = HashMap::new();
+    let mut raw: FastMap<(&'a str, &'a str), PartitionRows> = FastMap::default();
     for (i, invoice) in invoices.iter().enumerate() {
         if invoice.amount_minor > 0 {
             let key = (invoice.scope.as_str(), invoice.currency.as_str());
@@ -681,7 +682,7 @@ impl Engine<'_> {
             }
         }
         let mut candidates = Vec::new();
-        let mut all_mentions = Mentions::new();
+        let mut all_mentions = Mentions::default();
         if by_number.is_empty() {
             return Ok((candidates, all_mentions));
         }
@@ -935,7 +936,8 @@ impl Engine<'_> {
         );
         let mut similar = SimilarBuckets::new(&payments);
         // Invoices that some payment of the partition names; any other has share 0.
-        let named: HashSet<usize> = mentions.values().flatten().copied().collect();
+        let mut named: FastSet<usize> = FastSet::default();
+        named.extend(mentions.values().flatten().copied());
         for i in invoices {
             if self.skip_unnamed && !named.contains(&i) {
                 continue;
@@ -986,8 +988,8 @@ impl Engine<'_> {
     /// candidate is never ambiguous by the margin rule.
     fn assign(&self, mut candidates: Vec<Candidate>, state: &mut Assigned<'_>) {
         let config = self.config;
-        let mut top_two: HashMap<Anchor, (f64, f64)> = HashMap::new();
-        let mut groups_per_anchor: HashMap<Anchor, usize> = HashMap::new();
+        let mut top_two: FastMap<Anchor, (f64, f64)> = FastMap::default();
+        let mut groups_per_anchor: FastMap<Anchor, usize> = FastMap::default();
         for c in &candidates {
             let (first, second) = top_two
                 .entry(c.anchor)
@@ -1121,7 +1123,7 @@ fn within_days(
 // partition holds tens of thousands of distinct names.
 struct SimilarBuckets<'a, 'b> {
     buckets: &'b BTreeMap<&'a str, Vec<usize>>,
-    cache: HashMap<&'b str, Vec<&'b Vec<usize>>>,
+    cache: FastMap<&'b str, Vec<&'b Vec<usize>>>,
 }
 
 impl<'a, 'b> SimilarBuckets<'a, 'b> {
@@ -1129,7 +1131,7 @@ impl<'a, 'b> SimilarBuckets<'a, 'b> {
     fn new(buckets: &'b BTreeMap<&'a str, Vec<usize>>) -> Self {
         Self {
             buckets,
-            cache: HashMap::new(),
+            cache: FastMap::default(),
         }
     }
 
