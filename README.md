@@ -5,7 +5,7 @@ including split and grouped payments (1:1, 1:N and N:1), and explains every matc
 per-signal score. Remittance matching is the accounts-receivable term for linking an
 incoming payment to the invoices it settles.
 
-**Status:** alpha. `0.1.0a2` is the current pre-release. The API may still change before
+**Status:** alpha. `0.1.0a3` is the current pre-release. The API may still change before
 `0.1.0`, and accuracy has only been measured on synthetic data, so read
 [Before you rely on it](#before-you-rely-on-it) first.
 
@@ -244,7 +244,7 @@ C stream and each value is copied once into the core structs. The core itself is
 
 With the data spread over several scopes, `remitmatch` on all 16 threads of the test machine is 1.87 to 2.41 times faster than pandas + rapidfuzz and 2.14 to 5.08 times faster than pure Python on one-to-one data. On one thread it is about equal to pandas + rapidfuzz at 10,000 payments (0.96 times as long) and 1.22 and 1.15 times slower at 100,000 and 1,000,000, and still 1.19 to 1.84 times faster than pure Python. With one large scope it is 1.40, 1.00 and 1.12 times as fast as pandas + rapidfuzz on all threads. On data with grouped and partial payments it finds more of the true groups (93.1 to 94.9 % against 88.1 to 88.5 %), and is 1.58, 1.11 and 1.61 times as fast as pandas + rapidfuzz with four scopes but 2.55 to 2.82 times slower with one scope. The target of 20 times over pandas + rapidfuzz is not met in any layout (the best ratio is 2.41), and the peak memory of `remitmatch` is higher than that of pandas + rapidfuzz at every size.
 
-`remitmatch` was compared with two ways of doing the same job in Python on the same synthetic data: a pure Python baseline (standard library only) and a pandas + rapidfuzz baseline. Both are one-to-one matchers written for this benchmark and made as fast as a plain formulation reasonably gets; both run on one thread. `remitmatch` is measured twice, on all 16 threads of the machine (rayon's default) and restricted to one thread (`RAYON_NUM_THREADS=1`). Time is the matching call alone, including the conversion of the answer to groups of ids; peak memory is the whole process. The figures are for a release build of `main` at commit `f9de1dd`, after `0.1.0a2`; the published `0.1.0a2` is slower.
+`remitmatch` was compared with two ways of doing the same job in Python on the same synthetic data: a pure Python baseline (standard library only) and a pandas + rapidfuzz baseline. Both are one-to-one matchers written for this benchmark and made as fast as a plain formulation reasonably gets; both run on one thread. `remitmatch` is measured twice, on all 16 threads of the machine (rayon's default) and restricted to one thread (`RAYON_NUM_THREADS=1`). Time is the matching call alone, including the conversion of the answer to groups of ids; peak memory is the whole process. The figures are for a release build of `main` at commit `f9de1dd`, the engine released as `0.1.0a3`; `0.1.0a2` is slower.
 
 ![Run time by number of payments for remitmatch on 16 threads and on 1 thread, pure Python and pandas + rapidfuzz, one-to-one dataset, four scopes](https://raw.githubusercontent.com/eamigo86/remitmatch/main/benchmarks/results/time.png)
 
@@ -298,7 +298,7 @@ Read the numbers with these caveats:
 - About 9.5 % of all payments carry no invoice number; in the rest it appears in one of a few formats, which makes an exact dictionary lookup very effective.
 - The baselines hardcode the `INV` prefix of the invoice numbers; `remitmatch` does not need to know it. With any other prefix the baselines find nothing. In an exploratory measurement, not in the results file, a regular expression that accepts any three letters as a prefix made pure Python about 36 % slower and pandas + rapidfuzz about 3 % slower at 100,000 payments, with no measurable difference at 1,000,000.
 - One machine (Apple M3 Max, 16 threads, 128 GB, macOS, Python 3.14), heavily shared with other work: the load average was between 7 and 15 on 16 threads while the benchmark ran. The effect on the 16-thread `remitmatch` and on the single-threaded baselines was not measured. Best of 3 runs up to 100,000 payments and a single run at 1,000,000. The garbage collector was off during every timed call.
-- Build: release build of `main` at commit `f9de1dd`, after `0.1.0a2`.
+- Build: release build of `main` at commit `f9de1dd`, the engine released as `0.1.0a3`.
 - reconPy, which the RFC mentions, is not included: it only takes a percentage tolerance and joins on exact columns, so it cannot express "within 300 minor units" and would build every pair within a scope. See [`benchmarks/README.md`](https://github.com/eamigo86/remitmatch/blob/main/benchmarks/README.md).
 
 To reproduce: `uv sync --group bench`, `uv run --no-sync maturin develop --release`, then `uv run --no-sync python benchmarks/run.py --remitmatch-build release --commit "$(git rev-parse --short HEAD)"`. The details are in `benchmarks/README.md`.
@@ -308,7 +308,7 @@ To reproduce: `uv sync --group bench`, `uv run --no-sync maturin develop --relea
 The matching engine is a plain Rust crate with the same `reconcile` entry point:
 
 ```bash
-cargo add remitmatch@0.1.0-alpha.2
+cargo add remitmatch@0.1.0-alpha.3
 ```
 
 ## Build from source
