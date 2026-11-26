@@ -731,6 +731,28 @@ impl Engine<'_> {
         }
     }
 
+    /// Scores the 1:1 candidate of payment `p` and invoice `i`, or returns `None` when it
+    /// cannot matter.
+    ///
+    /// A candidate whose score satisfies the test of [`cannot_matter`] can neither be accepted
+    /// (it is below the suggest threshold) nor make an accepted candidate of its anchor
+    /// ambiguous (that needs a second best within the margin of a first that scores at least
+    /// the threshold), so it is not materialized. This holds for single candidates only:
+    /// the group rule counts every fitting group of an anchor, whatever its score.
+    fn single_candidate(&self, p: usize, i: usize, reference: f64) -> Option<Candidate> {
+        let candidate = self.candidate(
+            Anchor::Payment(p),
+            Members::One(p),
+            Members::One(i),
+            reference,
+            false,
+        );
+        let config = self.config;
+        let ignorable = candidate.score <= config.suggest_threshold - config.ambiguity_margin
+            && !meets(candidate.score, config.suggest_threshold);
+        (!ignorable).then_some(candidate)
+    }
+
     /// Returns the subsets of `rows` whose amounts add up to `target` within the tolerance.
     ///
     /// `amount` reads a row's amount. Each subset lists ascending input indices; at most
@@ -807,13 +829,7 @@ impl Engine<'_> {
                     .amount_minor
                     .abs_diff(self.invoices[i].amount_minor);
                 if diff <= self.tolerance {
-                    candidates.push(self.candidate(
-                        Anchor::Payment(p),
-                        Members::One(p),
-                        Members::One(i),
-                        1.0,
-                        false,
-                    ));
+                    candidates.extend(self.single_candidate(p, i, 1.0));
                 }
             }
             let pool = oldest(mentioned.iter().copied().collect(), |i| {
@@ -903,7 +919,7 @@ impl Engine<'_> {
         open[start..end]
             .iter()
             .filter(|&&(_, i)| self.within_window(pay.value_date, self.invoices[i].due_date))
-            .map(|&(_, i)| {
+            .filter_map(|&(_, i)| {
                 let reference = if explained {
                     0.0
                 } else {
@@ -913,13 +929,7 @@ impl Engine<'_> {
                         Some((&self.invoice_number_counts[i], &reference_counts)),
                     )
                 };
-                self.candidate(
-                    Anchor::Payment(payment),
-                    Members::One(payment),
-                    Members::One(i),
-                    reference,
-                    false,
-                )
+                self.single_candidate(payment, i, reference)
             })
             .collect()
     }
@@ -1549,6 +1559,80 @@ mod tests {
             validate(&invoices, &payments, &bad, true),
             Err(Error::InvalidConfig(_))
         ));
+    }
+
+    /// One payment of 1,000 against invoices whose amount signals are the given differences
+    /// from it, scored on the amount alone with a tolerance of 100 minor units, so an invoice
+    /// that differs by `d` scores `1 - d / 100`. Returns the status of each match by invoice.
+    fn statuses_for(differences: &[i64], margin: f64) -> Vec<(String, MatchStatus)> {
+        let day = NaiveDate::from_ymd_opt(2024, 1, 10).unwrap();
+        let invoices: Vec<Invoice> = differences
+            .iter()
+            .enumerate()
+            .map(|(k, d)| Invoice {
+                id: format!("i{k}"),
+                number: format!("N{k}"),
+                amount_minor: 1_000 + d,
+                currency: "EUR".to_owned(),
+                issue_date: day,
+                due_date: day,
+                counterparty: "Acme".to_owned(),
+                scope: "s".to_owned(),
+            })
+            .collect();
+        let payments = vec![Payment {
+            id: "p".to_owned(),
+            amount_minor: 1_000,
+            currency: "EUR".to_owned(),
+            value_date: day,
+            reference: String::new(),
+            counterparty: "Acme".to_owned(),
+            scope: "s".to_owned(),
+        }];
+        let config = MatchConfig {
+            amount_tolerance_minor: 100,
+            ambiguity_margin: margin,
+            max_group_size: 1,
+            weights: [("amount".to_owned(), 1.0)].into_iter().collect(),
+            ..MatchConfig::default()
+        };
+        reconcile(&invoices, &payments, &config)
+            .unwrap()
+            .matches
+            .into_iter()
+            .map(|m| (m.invoice_ids[0].clone(), m.status))
+            .collect()
+    }
+
+    #[test]
+    fn a_second_candidate_at_the_pruning_bound_keeps_its_effect_on_the_status() {
+        use MatchStatus::{Ambiguous, Suggested};
+        let status = |differences: &[i64], margin| {
+            let found = statuses_for(differences, margin);
+            assert_eq!(found.len(), 1, "one payment, one match: {found:?}");
+            found[0].1
+        };
+        // Scores 0.60 and then 0.55 (exactly threshold - margin), 0.56 and 0.45 (far below).
+        assert_eq!(
+            status(&[40, 45], 0.05),
+            Suggested,
+            "at the bound: not ambiguous"
+        );
+        assert_eq!(
+            status(&[40, 44], 0.05),
+            Ambiguous,
+            "just above it: ambiguous"
+        );
+        assert_eq!(status(&[40, 55], 0.05), Suggested);
+        // With no margin nothing is ambiguous, however close.
+        assert_eq!(status(&[40, 40], 0.0), Suggested);
+        assert_eq!(status(&[40, 41], 0.0), Suggested);
+        assert_eq!(status(&[40, 45], 0.0), Suggested);
+        // A first candidate just under the threshold is still accepted through the tolerance.
+        assert_eq!(status(&[40, 39], 0.05), Ambiguous);
+        // A lone candidate below the threshold is not accepted at all.
+        assert!(statuses_for(&[41], 0.05).is_empty());
+        assert!(statuses_for(&[41, 45, 70], 0.05).is_empty());
     }
 
     #[test]
