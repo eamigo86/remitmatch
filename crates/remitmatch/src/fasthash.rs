@@ -1,8 +1,12 @@
 //! A small multiplicative hasher for the engine's internal maps and sets.
 //!
-//! The engine hashes row ids, names and row indices that it holds itself and never iterates
-//! a hash map to decide anything, so the default hasher's protection against crafted keys
-//! costs time (about a tenth of a single-threaded run) and buys nothing here.
+//! It is only safe for keys that the engine generates itself: row indices, anchors and
+//! pairs of internal ids. Its constant is fixed and it is not seeded, so anyone who can
+//! choose the keys can make them collide and turn a map quadratic. Keys that are caller or
+//! bank text, or are derived directly from it (ids, invoice numbers and their substrings,
+//! names, scope and currency), must use the standard `HashMap` and `HashSet` with the
+//! default randomly seeded hasher. The engine never decides anything from a map's iteration
+//! order, which the random seed would otherwise change between runs.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};

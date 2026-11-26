@@ -1,7 +1,7 @@
 //! The matching engine: validation, partitioning, the reference passes, the 1:1 candidate
 //! pass, group search and greedy assignment.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -111,12 +111,13 @@ impl Names {
     /// Normalizes the distinct texts of `rows`; `text` reads the raw name of a row.
     fn new<T: Sync>(rows: &[T], parallel: bool, text: impl Fn(&T) -> &str + Sync + Send) -> Self {
         let mut raw: Vec<&str> = if parallel {
+            // Default hasher, as for `position` below.
             rows.par_iter()
-                .fold(FastSet::default, |mut seen, row| {
+                .fold(HashSet::new, |mut seen, row| {
                     seen.insert(text(row));
                     seen
                 })
-                .reduce(FastSet::default, |mut all, seen| {
+                .reduce(HashSet::new, |mut all, seen| {
                     all.extend(seen);
                     all
                 })
@@ -125,17 +126,20 @@ impl Names {
         } else {
             rows.iter()
                 .map(&text)
-                .collect::<FastSet<_>>()
+                .collect::<HashSet<_>>()
                 .into_iter()
                 .collect()
         };
         // Sorted, so the layout does not depend on how the threads were scheduled.
         raw.sort_unstable();
-        let position: FastMap<&str, usize> = raw.iter().enumerate().map(|(k, &t)| (t, k)).collect();
+        // Default hasher: the texts are counterparty names from the caller or a bank feed, and
+        // a fixed-constant hasher would let crafted names collide.
+        let position: HashMap<&str, usize> = raw.iter().enumerate().map(|(k, &t)| (t, k)).collect();
         let normalized = map_rows(&raw, parallel, |&t| normalize_name(t));
         // Different raw texts often normalize to the same name ("Acme S.L." and "ACME").
         let mut distinct: Vec<String> = Vec::new();
-        let mut known: FastMap<&str, usize> = FastMap::default();
+        // Default hasher: keyed by normalized names derived from caller text.
+        let mut known: HashMap<&str, usize> = HashMap::new();
         let name_of_raw: Vec<usize> = normalized
             .iter()
             .map(|name| {
@@ -219,7 +223,10 @@ enum NumberIndex<'a> {
     /// Looks up every substring of one of the few lengths that numbers have.
     Lengths {
         lengths: Vec<usize>,
-        groups: FastMap<&'a str, Vec<usize>>,
+        /// Whether some number starts with this byte; other positions are not looked up.
+        first_bytes: Box<[bool; 256]>,
+        /// Keyed by caller text, so it uses the default hasher.
+        groups: HashMap<&'a str, Vec<usize>>,
     },
     /// Scans the text once for all numbers.
     Automaton {
@@ -232,32 +239,44 @@ impl<'a> NumberIndex<'a> {
     /// Indexes the distinct non-empty `numbers`, each with its invoices; at most
     /// `max_lengths` distinct byte lengths are looked up by hash, otherwise an automaton
     /// is built.
-    fn new(numbers: Vec<(&'a str, Vec<usize>)>, max_lengths: usize) -> Result<Self, Error> {
-        let mut lengths: Vec<usize> = numbers.iter().map(|(number, _)| number.len()).collect();
+    fn new(numbers: HashMap<&'a str, Vec<usize>>, max_lengths: usize) -> Result<Self, Error> {
+        let mut lengths: Vec<usize> = numbers.keys().map(|number| number.len()).collect();
         lengths.sort_unstable();
         lengths.dedup();
         if lengths.len() <= max_lengths {
+            let mut first_bytes = Box::new([false; 256]);
+            for number in numbers.keys() {
+                if let Some(&byte) = number.as_bytes().first() {
+                    first_bytes[usize::from(byte)] = true;
+                }
+            }
             return Ok(Self::Lengths {
                 lengths,
-                groups: numbers.into_iter().collect(),
+                first_bytes,
+                groups: numbers,
             });
         }
+        let (keys, groups): (Vec<&str>, Vec<Vec<usize>>) = numbers.into_iter().unzip();
         let automaton = AhoCorasick::builder()
             .match_kind(AcMatchKind::Standard)
-            .build(numbers.iter().map(|(number, _)| number))
+            .build(&keys)
             .map_err(|e| Error::ReferenceIndex(e.to_string()))?;
-        Ok(Self::Automaton {
-            automaton,
-            groups: numbers.into_iter().map(|(_, rows)| rows).collect(),
-        })
+        Ok(Self::Automaton { automaton, groups })
     }
 
     /// Calls `visit` with the byte range and the invoices of every occurrence of a number in
     /// `text`, overlapping ones included.
     fn find(&self, text: &str, mut visit: impl FnMut(usize, usize, &[usize])) {
         match self {
-            Self::Lengths { lengths, groups } => {
-                for start in 0..text.len() {
+            Self::Lengths {
+                lengths,
+                first_bytes,
+                groups,
+            } => {
+                for (start, &byte) in text.as_bytes().iter().enumerate() {
+                    if !first_bytes[usize::from(byte)] {
+                        continue;
+                    }
                     for &length in lengths {
                         // `get` is `None` past the end and off a character boundary.
                         let rows = text
@@ -327,14 +346,11 @@ pub(crate) fn reconcile(
     payments: &[Payment],
     config: &MatchConfig,
 ) -> Result<ReconciliationResult, Error> {
-    validate(invoices, payments, config)?;
+    // The owner is taken first: the id checks may already use the thread pool.
     let owner = *POOL_OWNER.get_or_init(std::process::id);
-    reconcile_validated(
-        invoices,
-        payments,
-        config,
-        runs_in_parallel(owner, std::process::id()),
-    )
+    let parallel = runs_in_parallel(owner, std::process::id());
+    validate(invoices, payments, config, parallel)?;
+    reconcile_validated(invoices, payments, config, parallel)
 }
 
 /// Maps every row with `f`, keeping the input order; the rows run on the thread pool only
@@ -460,22 +476,37 @@ fn unmatched<'a>(ids: impl Iterator<Item = &'a String>, taken: &[AtomicBool]) ->
 }
 
 /// Rejects duplicate ids and out-of-range configuration.
-fn validate(invoices: &[Invoice], payments: &[Payment], config: &MatchConfig) -> Result<(), Error> {
+///
+/// The two id checks are independent and run side by side on the thread pool when `parallel`
+/// is set; the error of the invoices still comes before the one of the payments.
+fn validate(
+    invoices: &[Invoice],
+    payments: &[Payment],
+    config: &MatchConfig,
+    parallel: bool,
+) -> Result<(), Error> {
     validate_config(config)?;
-    let mut seen = FastSet::with_capacity_and_hasher(invoices.len(), Default::default());
-    for invoice in invoices {
-        if !seen.insert(invoice.id.as_str()) {
-            return Err(Error::DuplicateInvoiceId(invoice.id.clone()));
-        }
+    let first_invoice = || first_repeat(invoices.iter().map(|i| i.id.as_str()));
+    let first_payment = || first_repeat(payments.iter().map(|p| p.id.as_str()));
+    let (invoice, payment) = if parallel {
+        rayon::join(first_invoice, first_payment)
+    } else {
+        (first_invoice(), first_payment())
+    };
+    if let Some(id) = invoice {
+        return Err(Error::DuplicateInvoiceId(id.to_owned()));
     }
-    seen.clear();
-    seen.reserve(payments.len());
-    for payment in payments {
-        if !seen.insert(payment.id.as_str()) {
-            return Err(Error::DuplicatePaymentId(payment.id.clone()));
-        }
+    if let Some(id) = payment {
+        return Err(Error::DuplicatePaymentId(id.to_owned()));
     }
     Ok(())
+}
+
+/// Returns the first id that repeats an earlier one, in iteration order.
+fn first_repeat<'a>(ids: impl ExactSizeIterator<Item = &'a str>) -> Option<&'a str> {
+    // Default hasher: ids are caller text, and crafted ids must not make the check quadratic.
+    let mut seen = HashSet::with_capacity(ids.len());
+    ids.into_iter().find(|&id| !seen.insert(id))
 }
 
 /// Checks every configuration field the 1:1 engine uses.
@@ -541,7 +572,8 @@ fn partitions<'a>(
     payments: &'a [Payment],
 ) -> BTreeMap<(&'a str, String), PartitionRows> {
     // Rows are first grouped by the raw pair, which costs no allocation per row.
-    let mut raw: FastMap<(&'a str, &'a str), PartitionRows> = FastMap::default();
+    // Default hasher: scope and currency are caller text.
+    let mut raw: HashMap<(&'a str, &'a str), PartitionRows> = HashMap::new();
     for (i, invoice) in invoices.iter().enumerate() {
         if invoice.amount_minor > 0 {
             let key = (invoice.scope.as_str(), invoice.currency.as_str());
@@ -745,7 +777,8 @@ impl Engine<'_> {
         invoice_rows: &[usize],
         payment_rows: &[usize],
     ) -> Result<(Vec<Candidate>, Mentions), Error> {
-        let mut by_number: FastMap<&str, Vec<usize>> = FastMap::default();
+        // Default hasher: invoice numbers are caller text.
+        let mut by_number: HashMap<&str, Vec<usize>> = HashMap::new();
         for &i in invoice_rows {
             let number = self.invoice_number[i].as_str();
             if !number.is_empty() {
@@ -757,7 +790,7 @@ impl Engine<'_> {
         if by_number.is_empty() {
             return Ok((candidates, all_mentions));
         }
-        let index = NumberIndex::new(by_number.into_iter().collect(), HASHED_LENGTHS_MAX)?;
+        let index = NumberIndex::new(by_number, HASHED_LENGTHS_MAX)?;
         for &p in payment_rows {
             let reference = &self.payment_reference[p];
             let mut mentioned = BTreeSet::new();
@@ -1190,7 +1223,8 @@ fn within_days(
 // partition holds tens of thousands of distinct names.
 struct SimilarBuckets<'a, 'b> {
     buckets: &'b BTreeMap<&'a str, Vec<usize>>,
-    cache: FastMap<&'b str, Vec<&'b Vec<usize>>>,
+    /// Keyed by names from caller text, so it uses the default hasher.
+    cache: HashMap<&'b str, Vec<&'b Vec<usize>>>,
 }
 
 impl<'a, 'b> SimilarBuckets<'a, 'b> {
@@ -1198,7 +1232,7 @@ impl<'a, 'b> SimilarBuckets<'a, 'b> {
     fn new(buckets: &'b BTreeMap<&'a str, Vec<usize>>) -> Self {
         Self {
             buckets,
-            cache: FastMap::default(),
+            cache: HashMap::new(),
         }
     }
 
@@ -1438,8 +1472,8 @@ mod tests {
                 ("É1", vec![3]),
             ]
         };
-        let by_lookup = NumberIndex::new(numbers(), 4).unwrap();
-        let by_automaton = NumberIndex::new(numbers(), 0).unwrap();
+        let by_lookup = NumberIndex::new(numbers().into_iter().collect(), 4).unwrap();
+        let by_automaton = NumberIndex::new(numbers().into_iter().collect(), 0).unwrap();
         assert!(matches!(by_lookup, NumberIndex::Lengths { .. }));
         assert!(matches!(by_automaton, NumberIndex::Automaton { .. }));
         for text in ["", "INV12", "PAGO INV1 INV12 12INV1", "É1É1 INV121", "INV"] {
@@ -1460,11 +1494,11 @@ mod tests {
     fn more_lengths_than_the_limit_use_the_automaton() {
         let numbers = vec![("AB", vec![0]), ("ABC", vec![1]), ("ABCD", vec![2])];
         assert!(matches!(
-            NumberIndex::new(numbers.clone(), 3).unwrap(),
+            NumberIndex::new(numbers.iter().cloned().collect(), 3).unwrap(),
             NumberIndex::Lengths { .. }
         ));
         assert!(matches!(
-            NumberIndex::new(numbers, 2).unwrap(),
+            NumberIndex::new(numbers.into_iter().collect(), 2).unwrap(),
             NumberIndex::Automaton { .. }
         ));
     }
@@ -1480,13 +1514,41 @@ mod tests {
                 .enumerate()
                 .map(|(k, p)| (p.as_str(), vec![k, k + 100]))
                 .collect();
-            let by_lookup = NumberIndex::new(numbers.clone(), usize::MAX).unwrap();
-            let by_automaton = NumberIndex::new(numbers, 0).unwrap();
+            let by_lookup = NumberIndex::new(numbers.iter().cloned().collect(), usize::MAX).unwrap();
+            let by_automaton = NumberIndex::new(numbers.into_iter().collect(), 0).unwrap();
             proptest::prop_assert_eq!(
                 occurrences(&by_lookup, &text),
                 occurrences(&by_automaton, &text)
             );
         }
+    }
+
+    #[test]
+    fn duplicate_ids_are_reported_in_the_same_order_in_both_modes() {
+        let (mut invoices, mut payments) = many_partitions(2);
+        let config = MatchConfig::default();
+        for parallel in [false, true] {
+            assert!(validate(&invoices, &payments, &config, parallel).is_ok());
+        }
+        payments[3].id = payments[1].id.clone();
+        for parallel in [false, true] {
+            let error = validate(&invoices, &payments, &config, parallel).unwrap_err();
+            assert!(matches!(error, Error::DuplicatePaymentId(ref id) if *id == payments[1].id));
+        }
+        invoices[5].id = invoices[2].id.clone();
+        for parallel in [false, true] {
+            // Both sides repeat an id; the invoice error comes first, as in a sequential check.
+            let error = validate(&invoices, &payments, &config, parallel).unwrap_err();
+            assert!(matches!(error, Error::DuplicateInvoiceId(ref id) if *id == invoices[2].id));
+        }
+        let bad = MatchConfig {
+            auto_threshold: 2.0,
+            ..MatchConfig::default()
+        };
+        assert!(matches!(
+            validate(&invoices, &payments, &bad, true),
+            Err(Error::InvalidConfig(_))
+        ));
     }
 
     #[test]
