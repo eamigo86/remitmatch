@@ -29,7 +29,15 @@ pub(crate) fn find_subsets(
     let low = i128::from(target) - i128::from(tolerance);
     let high = i128::from(target) + i128::from(tolerance);
     let mut found = Vec::new();
+    // Sums outside this range of the right half cannot match, which skips most searches.
+    let (lowest, highest) = match (right_subsets.first(), right_subsets.last()) {
+        (Some(&(lowest, ..)), Some(&(highest, ..))) => (lowest, highest),
+        _ => return found,
+    };
     for &(left_sum, left_size, left_mask) in &left_subsets {
+        if high - left_sum < lowest || low - left_sum > highest {
+            continue;
+        }
         let start = right_subsets.partition_point(|&(sum, ..)| sum < low - left_sum);
         let end = right_subsets.partition_point(|&(sum, ..)| sum <= high - left_sum);
         for &(_, right_size, right_mask) in &right_subsets[start..end] {
@@ -50,18 +58,21 @@ pub(crate) fn find_subsets(
 ///
 /// Bit `b` of the mask selects `half[b]`; `half` has at most 12 entries.
 fn subsets_of(half: &[i64], max_size: usize) -> Vec<(i128, usize, u32)> {
-    (0..1u32 << half.len())
-        .filter_map(|mask| {
-            let size = mask.count_ones() as usize;
-            let sum = half
-                .iter()
-                .enumerate()
-                .filter(|&(bit, _)| mask >> bit & 1 == 1)
-                .map(|(_, &amount)| i128::from(amount))
-                .sum();
-            (size <= max_size).then_some((sum, size, mask))
-        })
-        .collect()
+    // The sum of a mask is the sum of the mask without its lowest bit plus that amount.
+    let mut sums = vec![0_i128; 1 << half.len()];
+    let mut subsets = Vec::with_capacity(sums.len());
+    for mask in 0..1_u32 << half.len() {
+        if mask != 0 {
+            let rest = mask & (mask - 1);
+            sums[mask as usize] =
+                sums[rest as usize] + i128::from(half[mask.trailing_zeros() as usize]);
+        }
+        let size = mask.count_ones() as usize;
+        if size <= max_size {
+            subsets.push((sums[mask as usize], size, mask));
+        }
+    }
+    subsets
 }
 
 /// Returns the positions of the set bits of `mask`, shifted by `offset`.
@@ -194,6 +205,68 @@ mod tests {
         assert_eq!(first.len(), 9);
         for _ in 0..3 {
             assert_eq!(find_subsets(&amounts, 40, 0, 4, 9), first);
+        }
+    }
+
+    /// The search as it was before the sums were built incrementally and out-of-range sums
+    /// skipped: same enumeration order, one searched range per left subset.
+    fn find_subsets_reference(
+        amounts: &[i64],
+        target: i64,
+        tolerance: u64,
+        max_size: usize,
+        limit: usize,
+    ) -> Vec<Vec<usize>> {
+        let subsets_of = |half: &[i64]| -> Vec<(i128, usize, u32)> {
+            (0..1u32 << half.len())
+                .filter_map(|mask| {
+                    let size = mask.count_ones() as usize;
+                    let sum = (0..half.len())
+                        .filter(|&bit| mask >> bit & 1 == 1)
+                        .map(|bit| i128::from(half[bit]))
+                        .sum();
+                    (size <= max_size).then_some((sum, size, mask))
+                })
+                .collect()
+        };
+        let pool = &amounts[..amounts.len().min(GROUP_CANDIDATE_LIMIT)];
+        let (left, right) = pool.split_at(pool.len() / 2);
+        let left_subsets = subsets_of(left);
+        let mut right_subsets = subsets_of(right);
+        right_subsets.sort_unstable();
+        let low = i128::from(target) - i128::from(tolerance);
+        let high = i128::from(target) + i128::from(tolerance);
+        let mut found = Vec::new();
+        for &(left_sum, left_size, left_mask) in &left_subsets {
+            let start = right_subsets.partition_point(|&(sum, ..)| sum < low - left_sum);
+            let end = right_subsets.partition_point(|&(sum, ..)| sum <= high - left_sum);
+            for &(_, right_size, right_mask) in &right_subsets[start..end] {
+                if found.len() >= limit {
+                    return found;
+                }
+                if (2..=max_size).contains(&(left_size + right_size)) {
+                    let mut subset = indices(left_mask, 0);
+                    subset.extend(indices(right_mask, left.len()));
+                    found.push(subset);
+                }
+            }
+        }
+        found
+    }
+
+    proptest! {
+        #[test]
+        fn the_result_and_its_order_match_the_previous_search(
+            amounts in prop::collection::vec(-40i64..80, 0..27),
+            target in -50i64..400,
+            tolerance in 0u64..8,
+            max_size in 0usize..8,
+            limit in 0usize..40,
+        ) {
+            prop_assert_eq!(
+                find_subsets(&amounts, target, tolerance, max_size, limit),
+                find_subsets_reference(&amounts, target, tolerance, max_size, limit)
+            );
         }
     }
 
