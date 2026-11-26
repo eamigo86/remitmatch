@@ -227,7 +227,8 @@ fn best_ascii_window(number: &str, reference: &str, n: usize) -> f64 {
                     missing += 1;
                 }
             }
-            if end + 1 >= len && missing <= budget {
+            // A window whose best possible similarity does not beat what is found is skipped.
+            if end + 1 >= len && missing <= budget && similarity(missing, n, len) > best {
                 let window = &reference[end + 1 - len..=end];
                 let dist = strsim::damerau_levenshtein(number, window);
                 best = best.max(similarity(dist, n, len));
@@ -515,6 +516,29 @@ mod tests {
             number in "[ABC1]{4,9}",
             reference in "[ABC1 ]{0,30}",
         ) {
+            proptest::prop_assert_eq!(
+                fuzzy_reference_signal(&number, &reference).to_bits(),
+                naive_fuzzy_signal(&number, &reference).to_bits()
+            );
+        }
+
+        #[test]
+        fn the_best_window_wins_among_several_near_copies(
+            number in "[AB1]{5,9}",
+            first in "[AB1 ]{0,6}",
+            edit_a in 0usize..9,
+            middle in "[AB1 ]{0,6}",
+            edit_b in 0usize..9,
+            last in "[AB1 ]{0,6}",
+        ) {
+            // Each copy has one character replaced, so windows score differently.
+            let damaged = |at: usize| {
+                let mut chars: Vec<char> = number.chars().collect();
+                let at = at % chars.len();
+                chars[at] = if chars[at] == 'A' { 'B' } else { 'A' };
+                chars.into_iter().collect::<String>()
+            };
+            let reference = format!("{first}{}{middle}{}{last}", damaged(edit_a), damaged(edit_b));
             proptest::prop_assert_eq!(
                 fuzzy_reference_signal(&number, &reference).to_bits(),
                 naive_fuzzy_signal(&number, &reference).to_bits()
