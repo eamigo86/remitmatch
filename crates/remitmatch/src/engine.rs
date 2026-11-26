@@ -1,7 +1,7 @@
 //! The matching engine: validation, partitioning, the reference passes, the 1:1 candidate
 //! pass, group search and greedy assignment.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -30,7 +30,63 @@ type PartitionRows = (Vec<usize>, Vec<usize>);
 const GROUP_NAME_THRESHOLD: f64 = 0.85;
 
 /// Invoices each payment of a partition mentions exactly, by input index.
-type Mentions = FastMap<usize, BTreeSet<usize>>;
+/// Invoices each payment of a partition mentions exactly, stored flat.
+///
+/// Payments are added in ascending row order, so a lookup is a binary search, and the
+/// invoices of one payment are ascending and without repeats, the order of a sorted set.
+#[derive(Default)]
+struct Mentions {
+    /// Input rows of the payments that mention at least one invoice, ascending.
+    payments: Vec<usize>,
+    /// For each of those payments, the end of its invoices in `invoices`.
+    ends: Vec<usize>,
+    /// The invoice rows of every payment, one run after the other.
+    invoices: Vec<usize>,
+}
+
+impl Mentions {
+    /// Adds payment row `payment`, which must be above every row added before, with the
+    /// ascending, distinct rows of the invoices it mentions.
+    fn push(&mut self, payment: usize, invoices: &[usize]) {
+        debug_assert!(self.payments.last().is_none_or(|&last| last < payment));
+        self.payments.push(payment);
+        self.invoices.extend_from_slice(invoices);
+        self.ends.push(self.invoices.len());
+    }
+
+    /// Appends the payments of `other`, whose rows must all be above those held here.
+    fn append(&mut self, other: Mentions) {
+        debug_assert!(
+            self.payments
+                .last()
+                .zip(other.payments.first())
+                .is_none_or(|(last, first)| last < first)
+        );
+        let offset = self.invoices.len();
+        self.payments.extend(other.payments);
+        self.ends
+            .extend(other.ends.into_iter().map(|end| end + offset));
+        self.invoices.extend(other.invoices);
+    }
+
+    /// Returns the invoices payment row `payment` mentions, or `None` when it mentions none.
+    fn get(&self, payment: usize) -> Option<&[usize]> {
+        let at = self.payments.binary_search(&payment).ok()?;
+        let start = if at == 0 { 0 } else { self.ends[at - 1] };
+        Some(&self.invoices[start..self.ends[at]])
+    }
+
+    /// Returns whether payment `payment` mentions invoice `invoice`.
+    fn names(&self, payment: usize, invoice: usize) -> bool {
+        self.get(payment)
+            .is_some_and(|rows| rows.binary_search(&invoice).is_ok())
+    }
+
+    /// Returns the invoices that some payment mentions, with repeats across payments.
+    fn all_invoices(&self) -> &[usize] {
+        &self.invoices
+    }
+}
 
 /// The row a candidate search starts from; ambiguity is judged per anchor.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -603,7 +659,7 @@ fn is_mention(reference: &Reference, start: usize, end: usize) -> bool {
     let splits_digits = |edge: usize| {
         edge > 0
             && edge < bytes.len()
-            && !reference.gap_before[edge]
+            && !reference.gap_before(edge)
             && bytes[edge - 1].is_ascii_digit()
             && bytes[edge].is_ascii_digit()
     };
@@ -686,7 +742,7 @@ impl Engine<'_> {
             if state.payment_taken(p) {
                 Vec::new()
             } else {
-                self.window_candidates(p, &open, mentions.contains_key(&p))
+                self.window_candidates(p, &open, mentions.get(p).is_some())
             }
         });
         self.assign(candidates, state);
@@ -863,18 +919,18 @@ impl Engine<'_> {
         // chunks of payments run side by side and their results are joined in payment order.
         let parts = map_chunks(payment_rows, self.parallel, |chunk| {
             let mut found = Vec::new();
-            let mut mentions = Vec::new();
+            let mut mentions = Mentions::default();
             for &p in chunk {
                 if let Some((mentioned, mut own)) = self.payment_mentions(&index, p) {
                     found.append(&mut own);
-                    mentions.push((p, mentioned));
+                    mentions.push(p, &mentioned);
                 }
             }
             (found, mentions)
         });
         for (found, mentions) in parts {
             candidates.extend(found);
-            all_mentions.extend(mentions);
+            all_mentions.append(mentions);
         }
         Ok((candidates, all_mentions))
     }
@@ -885,9 +941,9 @@ impl Engine<'_> {
         &self,
         index: &NumberIndex<'_>,
         p: usize,
-    ) -> Option<(BTreeSet<usize>, Vec<Candidate>)> {
+    ) -> Option<(Vec<usize>, Vec<Candidate>)> {
         let reference = &self.payment_reference[p];
-        let mut mentioned = BTreeSet::new();
+        let mut mentioned = Vec::new();
         index.find(&reference.text, |start, end, rows| {
             if is_mention(reference, start, end) {
                 mentioned.extend(rows.iter().copied());
@@ -896,6 +952,9 @@ impl Engine<'_> {
         if mentioned.is_empty() {
             return None;
         }
+        // Ascending and without repeats, as a sorted set would hold them.
+        mentioned.sort_unstable();
+        mentioned.dedup();
         let mut candidates = Vec::new();
         for &i in &mentioned {
             let diff = self.payments[p]
@@ -905,9 +964,7 @@ impl Engine<'_> {
                 candidates.extend(self.single_candidate(p, i, 1.0));
             }
         }
-        let pool = oldest(mentioned.iter().copied().collect(), |i| {
-            self.invoices[i].due_date
-        });
+        let pool = oldest(mentioned.clone(), |i| self.invoices[i].due_date);
         let (groups, truncated) = self.fitting_groups(
             &pool,
             |i| self.invoices[i].amount_minor,
@@ -936,7 +993,7 @@ impl Engine<'_> {
     ) -> Vec<Candidate> {
         let mut naming: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for &p in payment_rows.iter().filter(|&&p| !state.payment_taken(p)) {
-            for &i in mentions.get(&p).into_iter().flatten() {
+            for &i in mentions.get(p).into_iter().flatten() {
                 if !state.invoice_taken(i) {
                     naming.entry(i).or_default().push(p);
                 }
@@ -1009,7 +1066,7 @@ impl Engine<'_> {
         let named = payments
             .iter()
             .flat_map(|&p| invoices.iter().map(move |&i| (p, i)))
-            .filter(|&(p, i)| mentions.get(&p).is_some_and(|set| set.contains(&i)))
+            .filter(|&(p, i)| mentions.names(p, i))
             .count();
         named as f64 / (payments.len() * invoices.len()) as f64
     }
@@ -1046,8 +1103,8 @@ impl Engine<'_> {
         for p in payments {
             // Without a free mentioned invoice every group has reference share 0.
             let names_one = mentions
-                .get(&p)
-                .is_some_and(|set| set.iter().any(|&i| !state.invoice_taken(i)));
+                .get(p)
+                .is_some_and(|rows| rows.iter().any(|&i| !state.invoice_taken(i)));
             if self.skip_unnamed && !names_one {
                 continue;
             }
@@ -1117,7 +1174,7 @@ impl Engine<'_> {
         let mut similar = SimilarBuckets::new(&payments);
         // Invoices that some payment of the partition names; any other has share 0.
         let mut named: FastSet<usize> = FastSet::default();
-        named.extend(mentions.values().flatten().copied());
+        named.extend(mentions.all_invoices().iter().copied());
         for i in invoices {
             if self.skip_unnamed && !named.contains(&i) {
                 continue;
@@ -1720,6 +1777,51 @@ mod tests {
         // A lone candidate below the threshold is not accepted at all.
         assert!(statuses_for(&[41], 0.05).is_empty());
         assert!(statuses_for(&[41, 45, 70], 0.05).is_empty());
+    }
+
+    #[test]
+    fn mentions_answer_like_a_map_of_sorted_sets() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let reference: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::from([
+            (2, BTreeSet::from([4, 9, 11])),
+            (5, BTreeSet::from([4])),
+            (40, BTreeSet::from([0, 1, 2, 3])),
+        ]);
+        let mut mentions = Mentions::default();
+        let mut tail = Mentions::default();
+        for (&payment, invoices) in &reference {
+            let rows: Vec<usize> = invoices.iter().copied().collect();
+            // The first payment goes to one part and the rest to another, joined afterwards.
+            if payment < 3 {
+                mentions.push(payment, &rows);
+            } else {
+                tail.push(payment, &rows);
+            }
+        }
+        mentions.append(tail);
+        for payment in 0..45 {
+            let expected: Option<Vec<usize>> =
+                reference.get(&payment).map(|s| s.iter().copied().collect());
+            assert_eq!(
+                mentions.get(payment).map(<[usize]>::to_vec),
+                expected,
+                "payment {payment}"
+            );
+            for invoice in 0..13 {
+                let named = reference
+                    .get(&payment)
+                    .is_some_and(|s| s.contains(&invoice));
+                assert_eq!(
+                    mentions.names(payment, invoice),
+                    named,
+                    "{payment} {invoice}"
+                );
+            }
+        }
+        let mut all: Vec<usize> = mentions.all_invoices().to_vec();
+        all.sort_unstable();
+        assert_eq!(all, [0, 1, 2, 3, 4, 4, 9, 11]);
+        assert!(Mentions::default().get(0).is_none());
     }
 
     #[test]
