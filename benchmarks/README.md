@@ -6,15 +6,20 @@ Python, on the same synthetic data. Every number below comes from
 
 ## Summary
 
-- On one-to-one data `remitmatch` is **not faster** than the two baselines on this machine: it
-  is 1.3 to 1.5 times slower than pandas + rapidfuzz at every size, and slower than pure
-  Python at 10,000 and 100,000 payments (1.4 and 1.15 times) but faster at 1,000,000
-  (3.7 s against 4.2 s). The RFC target of at least 20 times over pandas + rapidfuzz is
-  **not met**: the measured ratio is 0.78, 0.68 and 0.76 at 10,000, 100,000 and 1,000,000
-  payments.
-- Its peak memory is the highest at 100,000 and 1,000,000 payments (3.3 GB against 1.6 GB for
-  pandas + rapidfuzz at 1,000,000).
-- Precision is 99.99 % or better for every implementation. On the `mixed` dataset, which
+- On one-to-one data `remitmatch` is faster than both baselines at every size on this
+  machine: 2.04, 1.96 and 2.06 times faster than pandas + rapidfuzz at 10,000, 100,000 and
+  1,000,000 payments, and 1.83, 2.74 and 3.07 times faster than pure Python. The RFC target of
+  at least 20 times over pandas + rapidfuzz is **still not met**: the measured ratio is about 2.
+- Its peak memory is higher than that of pandas + rapidfuzz at every size (2.5 GB against
+  1.6 GB at 1,000,000 payments) and higher than that of pure Python at 10,000 and 100,000
+  payments, but lower than that of pure Python at 1,000,000 (2.5 GB against 2.7 GB).
+- The build measured is `main` at commit `7ccdca0`, after the published 0.1.0a2 (the package
+  version string is still 0.1.0a2). It includes performance work in the core. The previous
+  measurement, on the published 0.1.0a2, was 0.035 s, 0.339 s and 3.731 s for `remitmatch` on
+  one-to-one data at 10,000, 100,000 and 1,000,000 payments, which was slower than both
+  baselines at 10,000 and 100,000 and slower than pandas + rapidfuzz at 1,000,000. It is kept
+  here only as history; it is not a current number and is no longer in the results file.
+- Precision is 99.9 % or better for every implementation. On the `mixed` dataset, which
   contains payments that settle several invoices and invoices paid in parts, `remitmatch`
   finds 93.9 to 94.9 % of the true groups and the baselines 88.1 to 88.5 %, because they
   match one payment to one invoice only.
@@ -66,12 +71,14 @@ in its native form and the result. The resident size after loading the data is r
 well, so the memory of the call itself can be read as the difference.
 
 **Machine.** Apple M3 Max, 16 threads, 128 GB, macOS 27.2.1, Python 3.14.0, pandas 3.1.1,
-numpy 2.5.5, pyarrow 26.0.1, rapidfuzz 3.14.6. `remitmatch` is a **release build of version
-0.1.0a2** (`maturin develop --release`), using rayon's default of one thread per core. The
-machine was shared with other work during the run: the load average was between 3.8 and 5.3
-when each run started (it was already about 5 before the benchmark began, and it includes
-the benchmark itself), and the memory pressure was low. The load
-average of each run is in the results file.
+numpy 2.5.5, pyarrow 26.0.1, rapidfuzz 3.14.6. `remitmatch` is a **release build of `main` at
+commit `7ccdca0`, after 0.1.0a2** (`maturin develop --release`; the package version string is
+still 0.1.0a2), using rayon's default of one thread per core. The machine was heavily
+shared with other work: the load average was 13.6 before the run started (it stayed between
+12 and 18 during the four minutes I waited for it to drop) and between 12.7 and 20.9 when
+each run started, on 16 threads. That load affects every implementation, and the 16-thread
+`remitmatch` possibly more than the single-threaded baselines; how much was not measured. The
+load average of each run is in the results file.
 
 ## Results
 
@@ -79,69 +86,69 @@ average of each run is in the results file.
 
 | Payments | Implementation | Time | Peak memory | Precision | Recall | Precision of `auto` matches |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| 10,000 | remitmatch | 0.035 s | 181 MB | 100.000 % | 94.81 % | 100.000 % (7,863 matches) |
-| 10,000 | Pure Python | 0.025 s | 166 MB | 100.000 % | 94.91 % | n/a |
-| 10,000 | pandas + rapidfuzz | 0.027 s | 161 MB | 100.000 % | 94.91 % | n/a |
-| 100,000 | remitmatch | 0.339 s | 499 MB | 100.000 % | 94.79 % | 100.000 % (78,976 matches) |
-| 100,000 | Pure Python | 0.295 s | 402 MB | 99.999 % | 94.88 % | n/a |
-| 100,000 | pandas + rapidfuzz | 0.229 s | 291 MB | 99.999 % | 94.88 % | n/a |
-| 1,000,000 | remitmatch | 3.731 s | 3,260 MB | 100.000 % | 94.80 % | 100.000 % (790,907 matches) |
-| 1,000,000 | Pure Python | 4.229 s | 2,717 MB | 99.999 % | 94.91 % | n/a |
-| 1,000,000 | pandas + rapidfuzz | 2.824 s | 1,573 MB | 99.999 % | 94.91 % | n/a |
+| 10,000 | remitmatch | 0.016 s | 175 MB | 100.000 % | 94.81 % | 100.000 % (7,863 matches) |
+| 10,000 | Pure Python | 0.029 s | 170 MB | 100.000 % | 94.91 % | n/a |
+| 10,000 | pandas + rapidfuzz | 0.032 s | 163 MB | 100.000 % | 94.91 % | n/a |
+| 100,000 | remitmatch | 0.136 s | 415 MB | 100.000 % | 94.79 % | 100.000 % (78,976 matches) |
+| 100,000 | Pure Python | 0.374 s | 402 MB | 99.999 % | 94.88 % | n/a |
+| 100,000 | pandas + rapidfuzz | 0.268 s | 295 MB | 99.999 % | 94.88 % | n/a |
+| 1,000,000 | remitmatch | 1.594 s | 2,510 MB | 100.000 % | 94.80 % | 100.000 % (790,907 matches) |
+| 1,000,000 | Pure Python | 4.896 s | 2,709 MB | 99.999 % | 94.91 % | n/a |
+| 1,000,000 | pandas + rapidfuzz | 3.290 s | 1,575 MB | 99.999 % | 94.91 % | n/a |
 
 `mixed`:
 
 | Payments | Implementation | Time | Peak memory | Precision | Recall | Precision of `auto` matches |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| 10,000 | remitmatch | 0.035 s | 178 MB | 100.000 % | 94.90 % | 100.000 % (7,240 matches) |
-| 10,000 | Pure Python | 0.031 s | 165 MB | 100.000 % | 88.10 % | n/a |
-| 10,000 | pandas + rapidfuzz | 0.027 s | 163 MB | 100.000 % | 88.10 % | n/a |
-| 100,000 | remitmatch | 0.394 s | 488 MB | 99.994 % | 94.87 % | 99.999 % (72,653 matches) |
-| 100,000 | Pure Python | 0.365 s | 388 MB | 99.957 % | 88.40 % | n/a |
-| 100,000 | pandas + rapidfuzz | 0.225 s | 288 MB | 99.953 % | 88.40 % | n/a |
-| 1,000,000 | remitmatch | 4.244 s | 3,102 MB | 99.993 % | 93.88 % | 100.000 % (726,447 matches) |
-| 1,000,000 | Pure Python | 5.481 s | 2,627 MB | 99.924 % | 88.45 % | n/a |
-| 1,000,000 | pandas + rapidfuzz | 2.700 s | 1,338 MB | 99.917 % | 88.45 % | n/a |
+| 10,000 | remitmatch | 0.018 s | 173 MB | 100.000 % | 94.90 % | 100.000 % (7,240 matches) |
+| 10,000 | Pure Python | 0.035 s | 168 MB | 100.000 % | 88.10 % | n/a |
+| 10,000 | pandas + rapidfuzz | 0.031 s | 160 MB | 100.000 % | 88.10 % | n/a |
+| 100,000 | remitmatch | 0.198 s | 403 MB | 99.994 % | 94.87 % | 99.999 % (72,653 matches) |
+| 100,000 | Pure Python | 0.448 s | 386 MB | 99.957 % | 88.40 % | n/a |
+| 100,000 | pandas + rapidfuzz | 0.252 s | 293 MB | 99.953 % | 88.40 % | n/a |
+| 1,000,000 | remitmatch | 2.247 s | 2,407 MB | 99.993 % | 93.88 % | 100.000 % (726,447 matches) |
+| 1,000,000 | Pure Python | 6.467 s | 2,612 MB | 99.924 % | 88.45 % | n/a |
+| 1,000,000 | pandas + rapidfuzz | 3.077 s | 1,352 MB | 99.917 % | 88.45 % | n/a |
 
-Ratio of the time of `remitmatch` to the time of each baseline (above 1 means `remitmatch`
-is slower):
+Time of each baseline divided by the time of `remitmatch` (above 1 means `remitmatch` is
+faster):
 
 | Dataset | Payments | to pure Python | to pandas + rapidfuzz |
 | --- | ---: | ---: | ---: |
-| one-to-one | 10,000 | 1.40 | 1.28 |
-| one-to-one | 100,000 | 1.15 | 1.48 |
-| one-to-one | 1,000,000 | 0.88 | 1.32 |
-| mixed | 10,000 | 1.15 | 1.30 |
-| mixed | 100,000 | 1.08 | 1.75 |
-| mixed | 1,000,000 | 0.77 | 1.57 |
+| one-to-one | 10,000 | 1.83 | 2.04 |
+| one-to-one | 100,000 | 2.74 | 1.96 |
+| one-to-one | 1,000,000 | 3.07 | 2.06 |
+| mixed | 10,000 | 1.89 | 1.68 |
+| mixed | 100,000 | 2.26 | 1.27 |
+| mixed | 1,000,000 | 2.88 | 1.37 |
 
 Everything measured, including the build time, the time of the `reconcile` call alone, the
 memory after loading and the time of every run:
 
 | Dataset | Payments | Implementation | Time | reconcile call only | Build time | Memory after load | Peak memory | Precision | Recall | Precision of auto | Times of the runs |
 | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| one-to-one | 10,000 | remitmatch | 0.035 s | 0.032 s | 0.024 s | 149 MB | 181 MB | 100.000 % | 94.81 % | 100.000 % | 0.038, 0.035, 0.035 |
-| one-to-one | 10,000 | Pure Python | 0.025 s | n/a | 0.043 s | 159 MB | 166 MB | 100.000 % | 94.91 % | n/a | 0.025, 0.025, 0.025 |
-| one-to-one | 10,000 | pandas + rapidfuzz | 0.027 s | n/a | 0.025 s | 151 MB | 161 MB | 100.000 % | 94.91 % | n/a | 0.027, 0.028, 0.029 |
-| one-to-one | 100,000 | remitmatch | 0.339 s | 0.314 s | 0.030 s | 195 MB | 499 MB | 100.000 % | 94.79 % | 100.000 % | 0.358, 0.339, 0.344 |
-| one-to-one | 100,000 | Pure Python | 0.295 s | n/a | 0.229 s | 306 MB | 402 MB | 99.999 % | 94.88 % | n/a | 0.319, 0.295, 0.321 |
-| one-to-one | 100,000 | pandas + rapidfuzz | 0.229 s | n/a | 0.031 s | 195 MB | 291 MB | 99.999 % | 94.88 % | n/a | 0.233, 0.247, 0.229 |
-| one-to-one | 1,000,000 | remitmatch | 3.731 s | 3.436 s | 0.080 s | 533 MB | 3,260 MB | 100.000 % | 94.80 % | 100.000 % | 3.731 |
-| one-to-one | 1,000,000 | Pure Python | 4.229 s | n/a | 2.578 s | 1,752 MB | 2,717 MB | 99.999 % | 94.91 % | n/a | 4.229 |
-| one-to-one | 1,000,000 | pandas + rapidfuzz | 2.824 s | n/a | 0.092 s | 567 MB | 1,573 MB | 99.999 % | 94.91 % | n/a | 2.824 |
-| mixed | 10,000 | remitmatch | 0.035 s | 0.033 s | 0.024 s | 149 MB | 178 MB | 100.000 % | 94.90 % | 100.000 % | 0.037, 0.037, 0.035 |
-| mixed | 10,000 | Pure Python | 0.031 s | n/a | 0.042 s | 158 MB | 165 MB | 100.000 % | 88.10 % | n/a | 0.031, 0.031, 0.032 |
-| mixed | 10,000 | pandas + rapidfuzz | 0.027 s | n/a | 0.026 s | 153 MB | 163 MB | 100.000 % | 88.10 % | n/a | 0.028, 0.030, 0.027 |
-| mixed | 100,000 | remitmatch | 0.394 s | 0.368 s | 0.030 s | 195 MB | 488 MB | 99.994 % | 94.87 % | 99.999 % | 0.417, 0.401, 0.394 |
-| mixed | 100,000 | Pure Python | 0.365 s | n/a | 0.226 s | 303 MB | 388 MB | 99.957 % | 88.40 % | n/a | 0.365, 0.402, 0.371 |
-| mixed | 100,000 | pandas + rapidfuzz | 0.225 s | n/a | 0.031 s | 197 MB | 288 MB | 99.953 % | 88.40 % | n/a | 0.244, 0.232, 0.225 |
-| mixed | 1,000,000 | remitmatch | 4.244 s | 3.985 s | 0.078 s | 517 MB | 3,102 MB | 99.993 % | 93.88 % | 100.000 % | 4.244 |
-| mixed | 1,000,000 | Pure Python | 5.481 s | n/a | 2.504 s | 1,713 MB | 2,627 MB | 99.924 % | 88.45 % | n/a | 5.481 |
-| mixed | 1,000,000 | pandas + rapidfuzz | 2.700 s | n/a | 0.085 s | 526 MB | 1,338 MB | 99.917 % | 88.45 % | n/a | 2.700 |
+| one-to-one | 10,000 | remitmatch | 0.016 s | 0.015 s | 0.029 s | 148 MB | 175 MB | 100.000 % | 94.81 % | 100.000 % | 0.018, 0.017, 0.016 |
+| one-to-one | 10,000 | Pure Python | 0.029 s | n/a | 0.048 s | 162 MB | 170 MB | 100.000 % | 94.91 % | n/a | 0.029, 0.029, 0.029 |
+| one-to-one | 10,000 | pandas + rapidfuzz | 0.032 s | n/a | 0.030 s | 152 MB | 163 MB | 100.000 % | 94.91 % | n/a | 0.044, 0.032, 0.033 |
+| one-to-one | 100,000 | remitmatch | 0.136 s | 0.125 s | 0.035 s | 194 MB | 415 MB | 100.000 % | 94.79 % | 100.000 % | 0.158, 0.136, 0.151 |
+| one-to-one | 100,000 | Pure Python | 0.374 s | n/a | 0.256 s | 305 MB | 402 MB | 99.999 % | 94.88 % | n/a | 0.400, 0.394, 0.374 |
+| one-to-one | 100,000 | pandas + rapidfuzz | 0.268 s | n/a | 0.038 s | 200 MB | 295 MB | 99.999 % | 94.88 % | n/a | 0.273, 0.268, 0.275 |
+| one-to-one | 1,000,000 | remitmatch | 1.594 s | 1.466 s | 0.095 s | 519 MB | 2,510 MB | 100.000 % | 94.80 % | 100.000 % | 1.594 |
+| one-to-one | 1,000,000 | Pure Python | 4.896 s | n/a | 2.749 s | 1,747 MB | 2,709 MB | 99.999 % | 94.91 % | n/a | 4.896 |
+| one-to-one | 1,000,000 | pandas + rapidfuzz | 3.290 s | n/a | 0.098 s | 569 MB | 1,575 MB | 99.999 % | 94.91 % | n/a | 3.290 |
+| mixed | 10,000 | remitmatch | 0.018 s | 0.017 s | 0.027 s | 148 MB | 173 MB | 100.000 % | 94.90 % | 100.000 % | 0.018, 0.019, 0.018 |
+| mixed | 10,000 | Pure Python | 0.035 s | n/a | 0.047 s | 161 MB | 168 MB | 100.000 % | 88.10 % | n/a | 0.038, 0.036, 0.035 |
+| mixed | 10,000 | pandas + rapidfuzz | 0.031 s | n/a | 0.029 s | 150 MB | 160 MB | 100.000 % | 88.10 % | n/a | 0.031, 0.031, 0.031 |
+| mixed | 100,000 | remitmatch | 0.198 s | 0.187 s | 0.034 s | 193 MB | 403 MB | 99.994 % | 94.87 % | 99.999 % | 0.205, 0.198, 0.203 |
+| mixed | 100,000 | Pure Python | 0.448 s | n/a | 0.247 s | 302 MB | 386 MB | 99.957 % | 88.40 % | n/a | 0.448, 0.456, 0.453 |
+| mixed | 100,000 | pandas + rapidfuzz | 0.252 s | n/a | 0.038 s | 198 MB | 293 MB | 99.953 % | 88.40 % | n/a | 0.253, 0.254, 0.252 |
+| mixed | 1,000,000 | remitmatch | 2.247 s | 2.136 s | 0.087 s | 503 MB | 2,407 MB | 99.993 % | 93.88 % | 100.000 % | 2.247 |
+| mixed | 1,000,000 | Pure Python | 6.467 s | n/a | 2.638 s | 1,703 MB | 2,612 MB | 99.924 % | 88.45 % | n/a | 6.467 |
+| mixed | 1,000,000 | pandas + rapidfuzz | 3.077 s | n/a | 0.093 s | 547 MB | 1,352 MB | 99.917 % | 88.45 % | n/a | 3.077 |
 
 Build time is the time to read the Parquet file into the native form of each implementation.
 It is not part of the timed call, but it is a real cost for the pure Python baseline
-(2.5 s at 1,000,000 payments, against 0.08 s for Arrow tables).
+(2.7 s at 1,000,000 payments, against 0.10 s for Arrow tables).
 
 ## The implementations
 
@@ -194,15 +201,17 @@ What the baselines do not do:
   pure Python baseline took about three times longer at 1,000,000 payments and the pandas
   baseline about as much (the cost comes from the collector scanning the millions of live
   objects while the answer is built). Those exploratory numbers are not in the results file.
-- The 1,000,000 payment case is a single run. The spread of the three runs at 10,000 and
-  100,000 payments is between 0 and 10 percent of the best run (the file has every run).
+- The 1,000,000 payment case is a single run. The three runs at 10,000 and
+  100,000 payments differ by up to 16 percent from the best one, and by 37 percent in one case
+  (pandas + rapidfuzz at 10,000 payments, 0.044 s against 0.032 s), which the machine load
+  explains in part (the file has every run).
 - One machine, shared with other work. The numbers will differ elsewhere, and the ratios
   between implementations will too. Four scopes and two currencies give eight partitions that
   `remitmatch` processes in parallel; with a single large scope the parallelism disappears and
   the README of the project documents a quadratic cost inside one scope. That case is not
   measured here.
-- The `remitmatch` memory is the highest at 100,000 and 1,000,000 payments. It has not been
-  analysed further in this slice.
+- The `remitmatch` memory is higher than that of pandas + rapidfuzz at every size. It has not
+  been analysed further in this slice.
 
 ### What was tried to make the baselines faster
 
@@ -256,13 +265,13 @@ after the release build.
 ```bash
 uv sync --group bench
 uv run --no-sync maturin develop --release
-uv run --no-sync python benchmarks/run.py --remitmatch-build release
+uv run --no-sync python benchmarks/run.py --remitmatch-build release --commit "$(git rev-parse --short HEAD)"
 uv run --no-sync python benchmarks/plot.py
 uv run --no-sync maturin develop          # back to the debug build
 ```
 
 `run.py` takes `--sizes`, `--implementations`, `--datasets`, `--scopes`, `--seed`, `--runs`,
-`--timeout`, `--output`, `--remitmatch-build` and `--note`. For example, a quick run:
+`--timeout`, `--output`, `--remitmatch-build`, `--commit` and `--note`. For example, a quick run:
 
 ```bash
 uv run --no-sync python benchmarks/run.py --sizes 10000 --output /tmp/results.json

@@ -248,26 +248,30 @@ baseline. Both are 1:1 matchers written for this benchmark, and both were made a
 plain formulation reasonably gets. Time is the matching call alone, including the conversion
 of the answer to groups of ids; peak memory is the whole process.
 
-On one-to-one data (no grouped or partial payments), `remitmatch` is **not faster** than the
-baselines at the sizes measured: it is about 1.3 to 1.5 times slower than pandas + rapidfuzz
-at 10,000, 100,000 and 1,000,000 payments, and slower than pure Python at 10,000 and 100,000
-payments but faster at 1,000,000. It uses the most memory at the two larger sizes. The project
-target of 20 times over pandas + rapidfuzz is **not met**: the measured ratio is 0.78, 0.68
-and 0.76.
+On one-to-one data (no grouped or partial payments), `remitmatch` is faster than both baselines
+at all three sizes. Against pandas + rapidfuzz it is 2.04 times faster at 10,000 payments, 1.96
+times at 100,000 and 2.06 times at 1,000,000; against pure Python it is 1.83, 2.74 and 3.07
+times faster. The project target of 20 times over pandas + rapidfuzz is **still not met**: the
+measured ratio is about 2. Memory goes the other way: `remitmatch` has a higher peak than
+pandas + rapidfuzz at all three sizes (2,510 MB against 1,575 MB at 1,000,000 payments), a
+higher one than pure Python at 10,000 and 100,000 payments, and a lower one at 1,000,000
+(2,510 MB against 2,709 MB). These figures are for a release build of `main` at commit
+`7ccdca0`, after `0.1.0a2`, which includes performance work in the core; the published
+`0.1.0a2` is slower.
 
 ![Run time by number of payments for remitmatch, pure Python and pandas + rapidfuzz on the one-to-one dataset](https://raw.githubusercontent.com/eamigo86/remitmatch/main/benchmarks/results/time.png)
 
 | Payments | Implementation | Time | Peak memory | Precision | Recall | Precision of `auto` matches |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| 10,000 | remitmatch | 0.035 s | 181 MB | 100.000 % | 94.81 % | 100.000 % (7,863 matches) |
-| 10,000 | Pure Python | 0.025 s | 166 MB | 100.000 % | 94.91 % | n/a |
-| 10,000 | pandas + rapidfuzz | 0.027 s | 161 MB | 100.000 % | 94.91 % | n/a |
-| 100,000 | remitmatch | 0.339 s | 499 MB | 100.000 % | 94.79 % | 100.000 % (78,976 matches) |
-| 100,000 | Pure Python | 0.295 s | 402 MB | 99.999 % | 94.88 % | n/a |
-| 100,000 | pandas + rapidfuzz | 0.229 s | 291 MB | 99.999 % | 94.88 % | n/a |
-| 1,000,000 | remitmatch | 3.731 s | 3,260 MB | 100.000 % | 94.80 % | 100.000 % (790,907 matches) |
-| 1,000,000 | Pure Python | 4.229 s | 2,717 MB | 99.999 % | 94.91 % | n/a |
-| 1,000,000 | pandas + rapidfuzz | 2.824 s | 1,573 MB | 99.999 % | 94.91 % | n/a |
+| 10,000 | remitmatch | 0.016 s | 175 MB | 100.000 % | 94.81 % | 100.000 % (7,863 matches) |
+| 10,000 | Pure Python | 0.029 s | 170 MB | 100.000 % | 94.91 % | n/a |
+| 10,000 | pandas + rapidfuzz | 0.032 s | 163 MB | 100.000 % | 94.91 % | n/a |
+| 100,000 | remitmatch | 0.136 s | 415 MB | 100.000 % | 94.79 % | 100.000 % (78,976 matches) |
+| 100,000 | Pure Python | 0.374 s | 402 MB | 99.999 % | 94.88 % | n/a |
+| 100,000 | pandas + rapidfuzz | 0.268 s | 295 MB | 99.999 % | 94.88 % | n/a |
+| 1,000,000 | remitmatch | 1.594 s | 2,510 MB | 100.000 % | 94.80 % | 100.000 % (790,907 matches) |
+| 1,000,000 | Pure Python | 4.896 s | 2,709 MB | 99.999 % | 94.91 % | n/a |
+| 1,000,000 | pandas + rapidfuzz | 3.290 s | 1,575 MB | 99.999 % | 94.91 % | n/a |
 
 Recall stops near 95 % for every implementation because the 5 % of payments in the data that
 carry no invoice number cannot be matched by reference.
@@ -275,8 +279,8 @@ carry no invoice number cannot be matched by reference.
 The baselines cannot match a payment to several invoices or several payments to one invoice.
 On the `mixed` dataset, which contains both, `remitmatch` finds 93.9 to 94.9 % of the true
 groups and both baselines 88.1 to 88.5 %, with precision of 99.9 % or better for all three;
-at 1,000,000 payments the times are 4.244 s for `remitmatch`, 5.481 s for pure Python and
-2.700 s for pandas + rapidfuzz. The full tables, with build times and every run, are in
+at 1,000,000 payments the times are 2.247 s for `remitmatch`, 6.467 s for pure Python and
+3.077 s for pandas + rapidfuzz. The full tables, with build times and every run, are in
 [`benchmarks/README.md`](https://github.com/eamigo86/remitmatch/blob/main/benchmarks/README.md).
 
 Read the numbers with these caveats:
@@ -287,9 +291,11 @@ Read the numbers with these caveats:
 - In 95 % of the payments the reference contains the invoice number, in one of a few formats,
   which makes an exact dictionary lookup very effective. The baselines assume the invoice numbers start with `INV`;
   `remitmatch` does not need to know the prefix.
-- One machine (Apple M3 Max, 16 threads, 128 GB, macOS, Python 3.14) shared with other work,
-  with a load average of about 4 to 5 during the run, a release build of `remitmatch`
-  0.1.0a2, best of 3 runs up to 100,000 payments and a single run at 1,000,000. The garbage
+- One machine (Apple M3 Max, 16 threads, 128 GB, macOS, Python 3.14), heavily shared with
+  other work: the load average was between 12 and 21 on 16 threads while the benchmark ran,
+  which affects every implementation and the 16-thread `remitmatch` in a way that was not
+  measured. The build is a release build of `main` at commit `7ccdca0`, after `0.1.0a2`.
+  Best of 3 runs up to 100,000 payments and a single run at 1,000,000. The garbage
   collector was off during every timed call.
 - Four scopes and two currencies, so eight partitions that run in parallel. A single large
   scope was not measured.
@@ -298,7 +304,7 @@ Read the numbers with these caveats:
   pair within a scope. See [`benchmarks/README.md`](https://github.com/eamigo86/remitmatch/blob/main/benchmarks/README.md).
 
 To reproduce: `uv sync --group bench`, `uv run --no-sync maturin develop --release`, then
-`uv run --no-sync python benchmarks/run.py --remitmatch-build release`. The details are in
+`uv run --no-sync python benchmarks/run.py --remitmatch-build release --commit $(git rev-parse --short HEAD)`. The details are in
 `benchmarks/README.md`.
 
 ## Rust
