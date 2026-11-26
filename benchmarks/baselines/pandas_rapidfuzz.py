@@ -82,7 +82,10 @@ def _normalize(column: pd.Series) -> pa.Array:
     Returns:
         The normalized strings.
     """
-    return pc.replace_substring_regex(pc.utf8_upper(pa.array(column)), r"[\s/-]", "")
+    values = pa.array(column)
+    if isinstance(values, pa.ChunkedArray):  # large Parquet files give several chunks
+        values = values.combine_chunks()
+    return pc.replace_substring_regex(pc.utf8_upper(values), r"[\s/-]", "")
 
 
 def _tokens(references: pa.Array) -> tuple[np.ndarray, np.ndarray]:

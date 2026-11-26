@@ -141,6 +141,15 @@ def test_dates_and_scopes() -> None:
     assert {i.currency for i in data.invoices} == {"EUR", "USD"}
 
 
+def test_one_currency_and_one_scope_can_be_requested() -> None:
+    """A single scope with a single currency gives one partition, and the default is unchanged."""
+    one = generate.generate(2_000, generate.MIXED, seed=3, scopes=1, currencies=1)
+    assert {r.scope for r in one.invoices + one.payments} == {"scope-0"}
+    assert len({r.currency for r in one.invoices + one.payments}) == 1
+    default = generate.generate(2_000, generate.MIXED, seed=3)
+    assert default == generate.generate(2_000, generate.MIXED, seed=3, scopes=4, currencies=2)
+
+
 def test_scopes_and_currencies_never_cross_inside_a_group() -> None:
     """Every payment and invoice of a group share the scope and the currency."""
     data = generate.generate(4_000, generate.MIXED, seed=6)
@@ -367,7 +376,17 @@ def test_runner_measures_every_implementation(tmp_path: Path) -> None:
     Args:
         tmp_path: Directory for the results file.
     """
-    data = _small_run(tmp_path, "--runs", "2", "--remitmatch-build", "test", "--commit", "abc1234")
+    data = _small_run(
+        tmp_path,
+        "--runs",
+        "2",
+        "--layouts",
+        "four-scopes",
+        "--remitmatch-build",
+        "test",
+        "--commit",
+        "abc1234",
+    )
     meta = data["meta"]
     assert meta["sizes"] == [2000]
     assert meta["scopes"] == 4
@@ -377,9 +396,12 @@ def test_runner_measures_every_implementation(tmp_path: Path) -> None:
     assert meta["packages"]["remitmatch"]["commit"] == "abc1234"
     assert {r["implementation"] for r in data["results"]} == {
         "remitmatch",
+        "remitmatch-1-thread",
         "pure-python",
         "pandas-rapidfuzz",
     }
+    assert {r["layout"] for r in data["results"]} == {"four-scopes"}
+    assert meta["layouts"] == {"four-scopes": {"scopes": 4, "currencies": 2}}
     for result in data["results"]:
         assert result["status"] == "ok"
         assert len(result["runs"]) == 2
@@ -388,9 +410,28 @@ def test_runner_measures_every_implementation(tmp_path: Path) -> None:
         assert best["peak_rss_bytes"] >= best["rss_after_load_bytes"] > 0
         assert 0.9 <= best["precision"] <= 1.0
         assert 0.5 <= best["recall"] <= 1.0
-    remitmatch = next(r for r in data["results"] if r["implementation"] == "remitmatch")
+    by_name = {r["implementation"]: r for r in data["results"]}
+    assert by_name["remitmatch-1-thread"]["best"]["threads"] == 1
+    assert by_name["remitmatch-1-thread"]["best"]["rayon_num_threads"] == "1"
+    assert by_name["remitmatch"]["best"]["threads"] == meta["machine"]["cpu_count"]
+    assert by_name["pure-python"]["best"]["threads"] == 1
+    remitmatch = by_name["remitmatch"]
     assert 0.9 <= remitmatch["best"]["auto_precision"] <= 1.0
     assert remitmatch["best"]["time_call"] <= remitmatch["best"]["time_match"]
+
+
+def test_one_scope_layout_is_recorded(tmp_path: Path) -> None:
+    """The results file can hold a second layout, with one scope and one currency.
+
+    Args:
+        tmp_path: Directory for the results file.
+    """
+    data = _small_run(
+        tmp_path, "--implementations", "remitmatch", "pure-python", "--layouts", "one-scope"
+    )
+    assert data["meta"]["layouts"]["one-scope"] == {"scopes": 1, "currencies": 1}
+    assert {r["layout"] for r in data["results"]} == {"one-scope"}
+    assert all(r["status"] == "ok" for r in data["results"])
 
 
 def test_a_run_over_the_limit_is_recorded_as_not_finished(tmp_path: Path) -> None:
@@ -399,7 +440,9 @@ def test_a_run_over_the_limit_is_recorded_as_not_finished(tmp_path: Path) -> Non
     Args:
         tmp_path: Directory for the results file.
     """
-    data = _small_run(tmp_path, "--implementations", "pure-python", "--timeout", "0")
+    data = _small_run(
+        tmp_path, "--implementations", "pure-python", "--layouts", "four-scopes", "--timeout", "0"
+    )
     [result] = data["results"]
     assert result["status"] == "did_not_finish"
     assert result["best"] is None
@@ -417,6 +460,7 @@ def test_plot_draws_the_chart_files(tmp_path: Path) -> None:
         best = None if seconds is None else {"time_match": seconds}
         return {
             "implementation": name,
+            "layout": "four-scopes",
             "dataset": "one-to-one",
             "size": size,
             "status": "ok" if seconds else "did_not_finish",
@@ -424,7 +468,12 @@ def test_plot_draws_the_chart_files(tmp_path: Path) -> None:
         }
 
     results = {
-        "meta": {"machine": {"model": "Test CPU", "cpu_count": 4}, "runs_per_size": 3},
+        "meta": {
+            "machine": {"model": "Test CPU", "cpu_count": 4},
+            "runs_per_size": 3,
+            "load_average_start": [1.0, 1.0, 1.0],
+            "packages": {"remitmatch": {"commit": "abc1234"}},
+        },
         "results": [
             entry("remitmatch", 10_000, 0.05),
             entry("remitmatch", 100_000, 0.7),
@@ -432,6 +481,8 @@ def test_plot_draws_the_chart_files(tmp_path: Path) -> None:
             entry("pure-python", 100_000, 0.5),
             entry("pandas-rapidfuzz", 10_000, 0.03),
             entry("pandas-rapidfuzz", 100_000, None),
+            entry("remitmatch-1-thread", 10_000, 0.2),
+            entry("remitmatch-1-thread", 100_000, 2.0),
         ],
     }
     source = tmp_path / "results.json"
@@ -480,3 +531,22 @@ def test_baselines_know_only_the_inv_prefix(module: object) -> None:
     )
     payment = generate.Payment("p1", 100_000, "EUR", due, "Payment FAC-2024-0000001", "Acme", "s")
     assert module.match([invoice], [payment], 300) == []  # type: ignore[attr-defined]
+
+
+def test_pandas_baseline_accepts_frames_built_from_chunked_arrow_tables() -> None:
+    """Large Parquet files give multi-chunk columns, and the answer must not change."""
+    pa = pytest.importorskip("pyarrow")
+    data = generate.generate(3_000, generate.ONE_TO_ONE, seed=3)
+
+    def frame(rows: list[generate.Invoice] | list[generate.Payment]) -> object:
+        columns = list(zip(*rows, strict=True))
+        parts = []
+        for lo, hi in ((0, len(rows) // 2), (len(rows) // 2, len(rows))):
+            parts.append(
+                pa.table({f: list(c[lo:hi]) for f, c in zip(rows[0]._fields, columns, strict=True)})
+            )
+        return pa.concat_tables(parts).to_pandas(date_as_object=False)
+
+    expected = pandas_rapidfuzz.match(data.invoices, data.payments, 300)
+    chunked = pandas_rapidfuzz.match(frame(data.invoices), frame(data.payments), 300)  # type: ignore[arg-type]
+    assert chunked == expected

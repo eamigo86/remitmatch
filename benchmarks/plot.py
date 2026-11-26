@@ -1,7 +1,8 @@
 """Draw the run-time chart of the benchmark from the results file.
 
-One line per implementation, run time in seconds against the number of payments, both axes
-logarithmic, for the one-to-one dataset. Usage: python benchmarks/plot.py [results.json]
+One line per implementation (remitmatch twice, on all threads and on one), run time in
+seconds against the number of payments, both axes logarithmic, for the one-to-one dataset in
+the four-scopes layout. Usage: python benchmarks/plot.py [results.json]
 """
 
 from __future__ import annotations
@@ -27,11 +28,12 @@ MUTED = "#5f5f5c"
 GRID = "#e8e8e5"
 # Fixed order, one color per identity, never cycled.
 SERIES = [
-    ("remitmatch", "remitmatch", "#2a78d6"),
-    ("pure-python", "pure Python", "#eb6834"),
-    ("pandas-rapidfuzz", "pandas + rapidfuzz", "#1baf7a"),
-    ("fourth", "fourth", "#eda100"),
+    ("remitmatch", "remitmatch ({threads} threads)", "#2a78d6"),
+    ("pure-python", "pure Python (1 thread)", "#eb6834"),
+    ("pandas-rapidfuzz", "pandas + rapidfuzz (1 thread)", "#1baf7a"),
+    ("remitmatch-1-thread", "remitmatch (1 thread)", "#eda100"),
 ]
+LAYOUT = "four-scopes"
 
 
 def _seconds(value: float, _: object) -> str:
@@ -97,9 +99,17 @@ def draw(source: Path, png: Path, svg: Path) -> None:
     labels: list[tuple[float, float, str]] = []
     every: list[float] = []
     unfinished: list[str] = []
+    threads = meta.get("machine", {}).get("cpu_count", "?")
     for key, label, color in SERIES:
+        label = label.format(threads=threads)
         rows = sorted(
-            (r for r in data["results"] if r["implementation"] == key and r["dataset"] == DATASET),
+            (
+                r
+                for r in data["results"]
+                if r["implementation"] == key
+                and r["dataset"] == DATASET
+                and r.get("layout", LAYOUT) == LAYOUT
+            ),
             key=lambda r: r["size"],
         )
         finished = [r for r in rows if r["status"] == "ok"]
@@ -144,7 +154,7 @@ def draw(source: Path, png: Path, svg: Path) -> None:
             if False
             else [math.log10(t) for _, t, _ in labels]
         )
-        for (x, _, text), y in zip(labels, _spread(ys, 0.13), strict=True):
+        for (x, _, text), y in zip(labels, _spread(ys, 0.16), strict=True):
             ax.annotate(
                 text, (x, 10**y), xytext=(10, 0), textcoords="offset points",
                 va="center", color=INK, fontsize=9,
@@ -153,14 +163,18 @@ def draw(source: Path, png: Path, svg: Path) -> None:
     legend.set_zorder(4)
 
     machine = meta.get("machine", {})
+    load = meta.get("load_average_start", [float("nan")])[0]
+    commit = meta.get("packages", {}).get("remitmatch", {}).get("commit", "unknown")
     caption = (
-        f"{machine.get('model', 'unknown CPU')}, {machine.get('cpu_count', '?')} threads. "
-        f"Best of {meta.get('runs_per_size', 3)} runs up to 100,000 payments, one run at 1,000,000."
+        f"{machine.get('model', 'unknown CPU')}, {machine.get('cpu_count', '?')} threads; "
+        f"load average {load:.1f} when the run started; remitmatch release build of {commit}.\n"
+        f"Four scopes, two currencies. Best of {meta.get('runs_per_size', 3)} runs up to "
+        "100,000 payments, one run at 1,000,000."
     )
     if unfinished:
         caption += " " + "; ".join(unfinished) + "."
     fig.text(0.01, 0.01, caption, color=MUTED, fontsize=8, ha="left", va="bottom")
-    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    fig.tight_layout(rect=(0, 0.07, 1, 1))
     fig.savefig(png, dpi=200, facecolor=SURFACE)
     fig.savefig(svg, facecolor=SURFACE)
     plt.close(fig)

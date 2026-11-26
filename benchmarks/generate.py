@@ -248,7 +248,7 @@ def _strip_accents(text: str) -> str:
     return text.translate(_ACCENTS)
 
 
-def _customer(rng: _Rng, index: int, scopes: int) -> _Customer:
+def _customer(rng: _Rng, index: int, scopes: int, currencies: int) -> _Customer:
     words = [rng.choice(_FIRST), rng.choice(_SURNAMES), rng.choice(_CITIES)]
     suffix = rng.choice(_SUFFIXES)
     bank = [_strip_accents(w).upper() for w in words]
@@ -256,7 +256,7 @@ def _customer(rng: _Rng, index: int, scopes: int) -> _Customer:
         bank = [w[:8] for w in bank]
     if rng.chance(0.5):
         bank.append(_strip_accents(suffix).upper())
-    currency = rng.choice(_CURRENCIES)
+    currency = rng.choice(_CURRENCIES[:currencies])
     fixed = rng.between(1_000, 5_000_000) if rng.chance(0.2) else None
     return _Customer(
         name=" ".join([*words, suffix]),
@@ -421,7 +421,9 @@ class _Builder:
             self.pay_batch(customer, members)
 
 
-def generate(n_payments: int, noise: Noise, seed: int = 1, scopes: int = 4) -> Dataset:
+def generate(
+    n_payments: int, noise: Noise, seed: int = 1, scopes: int = 4, currencies: int = 2
+) -> Dataset:
     """Generate invoices, exactly n_payments payments and the correct pairing.
 
     Per invoice, in order: unpaid, else paid in parts, else joined to a batch, else paid by
@@ -437,6 +439,7 @@ def generate(n_payments: int, noise: Noise, seed: int = 1, scopes: int = 4) -> D
         noise: Probability of each kind of noise.
         seed: Seed of the random generator; the same seed gives the same data.
         scopes: Number of distinct scopes the customers are spread over.
+        currencies: Number of distinct currencies, 1 or 2.
 
     Returns:
         The invoices, the payments and the solution.
@@ -444,7 +447,7 @@ def generate(n_payments: int, noise: Noise, seed: int = 1, scopes: int = 4) -> D
     rng = _Rng(seed)
     unrelated = round(n_payments * noise.unrelated / (1 + noise.unrelated))
     target = n_payments - unrelated
-    customers = [_customer(rng, k, scopes) for k in range(max(1, n_payments // 10))]
+    customers = [_customer(rng, k, scopes, currencies) for k in range(max(1, n_payments // 10))]
     builder = _Builder(rng, noise)
     invoices: list[Invoice] = []
     batches: dict[int, tuple[list[Invoice], int]] = {}

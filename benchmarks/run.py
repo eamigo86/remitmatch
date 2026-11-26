@@ -44,7 +44,11 @@ from typing import Any
 
 import generate
 
-IMPLEMENTATIONS = ("remitmatch", "pure-python", "pandas-rapidfuzz")
+IMPLEMENTATIONS = ("remitmatch", "pure-python", "pandas-rapidfuzz", "remitmatch-1-thread")
+LAYOUTS = {
+    "four-scopes": {"scopes": 4, "currencies": 2},
+    "one-scope": {"scopes": 1, "currencies": 1},
+}
 TOLERANCE = 300
 RUNS_UP_TO = 100_000
 LOAD_LIMIT_SECONDS = 1800
@@ -143,6 +147,23 @@ def _timed(
     return groups, {"time_match": time.perf_counter() - start}, None
 
 
+def _os_threads() -> int | None:
+    """Count the operating system threads of this process, when the platform shows them.
+
+    Returns:
+        The number of threads, or None when it cannot be read.
+    """
+    try:
+        if sys.platform == "darwin":
+            out = subprocess.run(
+                ["ps", "-M", "-p", str(os.getpid())], capture_output=True, text=True, check=True
+            )
+            return len(out.stdout.strip().splitlines()) - 1
+        return len(os.listdir(f"/proc/{os.getpid()}/task"))
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
 def _child(implementation: str, directory: Path, tolerance: int) -> None:
     """Measure one implementation on one dataset and print the result as one JSON line.
 
@@ -154,10 +175,11 @@ def _child(implementation: str, directory: Path, tolerance: int) -> None:
     import pyarrow.parquet as pq
     from baselines import pandas_rapidfuzz, pure_python
 
+    is_remitmatch = implementation.startswith("remitmatch")
     start = time.perf_counter()
     inv_table = pq.read_table(directory / "invoices.parquet")
     pay_table = pq.read_table(directory / "payments.parquet")
-    if implementation == "remitmatch":
+    if is_remitmatch:
         inputs: tuple[Any, Any] = (inv_table, pay_table)
     elif implementation == "pure-python":
         inputs = (
@@ -188,13 +210,21 @@ def _child(implementation: str, directory: Path, tolerance: int) -> None:
         "peak_rss_after_load_bytes": _peak_rss(),
     }
 
-    if implementation == "remitmatch":
+    if is_remitmatch:
         groups, timings, result = _remitmatch(*inputs, tolerance)
     else:
         module = pure_python if implementation == "pure-python" else pandas_rapidfuzz
         groups, timings, result = _timed(module.match, *inputs, tolerance)
     out.update(timings)
     out["peak_rss_bytes"] = _peak_rss()
+    rayon = os.environ.get("RAYON_NUM_THREADS")
+    # Threads the implementation is allowed to use: rayon's pool for remitmatch (one per
+    # logical CPU unless RAYON_NUM_THREADS says otherwise), one for the baselines. The count
+    # of operating system threads after the call is informational: the interpreter and the
+    # libraries it loads start a few helper threads of their own.
+    out["threads"] = (int(rayon) if rayon else os.cpu_count()) if is_remitmatch else 1
+    out["rayon_num_threads"] = rayon
+    out["os_threads_after_call"] = _os_threads()
 
     solution = pickle.loads((directory / "solution.pkl").read_bytes())
     accuracy = generate.evaluate(groups, solution)
@@ -220,7 +250,7 @@ def _child(implementation: str, directory: Path, tolerance: int) -> None:
 
 
 def _write_dataset(
-    directory: Path, noise: generate.Noise, size: int, seed: int, scopes: int
+    directory: Path, noise: generate.Noise, size: int, seed: int, scopes: int, currencies: int
 ) -> tuple[int, int, int]:
     """Generate a dataset and write it, with its solution, to the directory.
 
@@ -230,6 +260,7 @@ def _write_dataset(
         size: Number of payments.
         seed: Seed of the generator.
         scopes: Number of scopes.
+        currencies: Number of currencies.
 
     Returns:
         The number of invoices, payments and solution groups.
@@ -237,7 +268,7 @@ def _write_dataset(
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    data = generate.generate(size, noise, seed=seed, scopes=scopes)
+    data = generate.generate(size, noise, seed=seed, scopes=scopes, currencies=currencies)
     types = {
         "amount_minor": pa.int64(),
         "issue_date": pa.date32(),
@@ -278,6 +309,9 @@ def _run_child(
         The child's measurements plus a status: ok, did_not_finish or error.
     """
     load_average = os.getloadavg()[0]
+    environment = dict(os.environ)
+    if implementation == "remitmatch-1-thread":
+        environment["RAYON_NUM_THREADS"] = "1"
     with tempfile.TemporaryFile() as errors:
         child = subprocess.Popen(
             [
@@ -288,6 +322,7 @@ def _run_child(
                 str(directory),
             ],
             stdout=subprocess.PIPE,
+            env=environment,
             stderr=errors,
         )
         assert child.stdout is not None
@@ -401,7 +436,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--datasets", nargs="+", choices=list(generate.DATASETS), default=list(generate.DATASETS)
     )
-    parser.add_argument("--scopes", type=int, default=4, help="number of scopes in the data")
+    parser.add_argument("--scopes", type=int, default=4, help="scopes of the four-scopes layout")
+    parser.add_argument("--layouts", nargs="+", choices=list(LAYOUTS), default=list(LAYOUTS))
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--runs", type=int, default=3, help="runs per size up to 100,000 payments")
     parser.add_argument("--timeout", type=float, default=600, help="seconds for the matching call")
@@ -411,6 +447,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--note", default="", help="free text recorded in the results file")
     options = parser.parse_args(args)
 
+    layouts = {name: dict(LAYOUTS[name]) for name in options.layouts}
+    if "four-scopes" in layouts:
+        layouts["four-scopes"]["scopes"] = options.scopes
     meta: dict[str, Any] = {
         "date": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "machine": _machine(),
@@ -420,6 +459,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "rayon_num_threads": os.environ.get("RAYON_NUM_THREADS"),
         "seed": options.seed,
         "scopes": options.scopes,
+        "layouts": layouts,
         "tolerance_minor": TOLERANCE,
         "sizes": sorted(options.sizes),
         "datasets": options.datasets,
@@ -440,49 +480,60 @@ def main(argv: Sequence[str] | None = None) -> int:
             json.dumps({"meta": meta, "results": results}, indent=2) + "\n", encoding="utf-8"
         )
 
-    unfinished: set[tuple[str, str]] = set()
+    unfinished: set[tuple[str, str, str]] = set()
     work = Path(tempfile.mkdtemp(prefix="remitmatch-bench-"))
     try:
-        for dataset in options.datasets:
-            for size in meta["sizes"]:
-                directory = work / f"{dataset}-{size}"
-                directory.mkdir()
-                print(f"generating {dataset} {size}", file=sys.stderr, flush=True)
-                n_invoices, n_payments, n_groups = _write_dataset(
-                    directory, generate.DATASETS[dataset], size, options.seed, options.scopes
-                )
-                for implementation in options.implementations:
-                    entry: dict[str, Any] = {
-                        "implementation": implementation,
-                        "dataset": dataset,
-                        "size": size,
-                        "invoices": n_invoices,
-                        "payments": n_payments,
-                        "solution_groups": n_groups,
-                        "runs": [],
-                    }
-                    if (implementation, dataset) in unfinished:
-                        entry.update(status="not_run", best=None)
-                    else:
-                        n_runs = options.runs if size <= RUNS_UP_TO else 1
-                        for _ in range(n_runs):
-                            print(f"{implementation} {dataset} {size}", file=sys.stderr, flush=True)
-                            run = _run_child(
-                                implementation, directory, options.timeout, LOAD_LIMIT_SECONDS
-                            )
-                            entry["runs"].append(run)
-                            if run["status"] != "ok":
-                                break
-                        best = pick_best(entry["runs"])
-                        entry["best"] = best
-                        if best is not None:
-                            entry["status"] = "ok"
+        for layout, shape in layouts.items():
+            for dataset in options.datasets:
+                for size in meta["sizes"]:
+                    directory = work / f"{layout}-{dataset}-{size}"
+                    directory.mkdir()
+                    print(f"generating {layout} {dataset} {size}", file=sys.stderr, flush=True)
+                    n_invoices, n_payments, n_groups = _write_dataset(
+                        directory,
+                        generate.DATASETS[dataset],
+                        size,
+                        options.seed,
+                        shape["scopes"],
+                        shape["currencies"],
+                    )
+                    for implementation in options.implementations:
+                        entry: dict[str, Any] = {
+                            "implementation": implementation,
+                            "layout": layout,
+                            "dataset": dataset,
+                            "size": size,
+                            "invoices": n_invoices,
+                            "payments": n_payments,
+                            "solution_groups": n_groups,
+                            "runs": [],
+                        }
+                        if (layout, implementation, dataset) in unfinished:
+                            entry.update(status="not_run", best=None)
                         else:
-                            entry["status"] = entry["runs"][-1]["status"]
-                            unfinished.add((implementation, dataset))
-                    results.append(entry)
-                    save()
-                shutil.rmtree(directory)
+                            n_runs = options.runs if size <= RUNS_UP_TO else 1
+                            for _ in range(n_runs):
+                                print(
+                                    f"{layout} {implementation} {dataset} {size}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                                run = _run_child(
+                                    implementation, directory, options.timeout, LOAD_LIMIT_SECONDS
+                                )
+                                entry["runs"].append(run)
+                                if run["status"] != "ok":
+                                    break
+                            best = pick_best(entry["runs"])
+                            entry["best"] = best
+                            if best is not None:
+                                entry["status"] = "ok"
+                            else:
+                                entry["status"] = entry["runs"][-1]["status"]
+                                unfinished.add((layout, implementation, dataset))
+                        results.append(entry)
+                        save()
+                    shutil.rmtree(directory)
     finally:
         shutil.rmtree(work, ignore_errors=True)
     meta["load_average_end"] = os.getloadavg()
