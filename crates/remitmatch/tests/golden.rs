@@ -71,7 +71,7 @@ fn exact_reference_and_amount_is_auto_with_zero_residual() {
     assert_eq!(m.invoice_ids, vec!["i1"]);
     assert_eq!(m.residual_minor, 0);
     assert!(close(m.score, 1.0));
-    let keys: Vec<&str> = m.breakdown.keys().map(String::as_str).collect();
+    let keys: Vec<&str> = m.breakdown.iter().map(|(name, _)| name).collect();
     assert_eq!(keys, vec!["amount", "date", "name", "reference"]);
     assert!(r.unmatched_payments.is_empty() && r.unmatched_invoices.is_empty());
 }
@@ -84,7 +84,7 @@ fn reference_with_spaces_dashes_and_lowercase_still_matches() {
         &MatchConfig::default(),
     );
     assert_eq!(r.matches.len(), 1);
-    assert!(close(r.matches[0].breakdown["reference"], 1.0));
+    assert!(close(r.matches[0].breakdown.reference, 1.0));
 }
 
 #[test]
@@ -101,7 +101,7 @@ fn bank_fee_within_tolerance_matches_with_negative_residual() {
     assert_eq!(r.matches.len(), 1);
     let m = &r.matches[0];
     assert_eq!(m.residual_minor, -30);
-    assert!(close(m.breakdown["amount"], 0.8));
+    assert!(close(m.breakdown.amount, 0.8));
     assert_eq!(m.status, MatchStatus::Auto);
 }
 
@@ -188,7 +188,7 @@ fn shorter_number_alone_gets_no_reference_score_inside_a_longer_one() {
         &no_reference_config(),
     );
     assert_eq!(r.matches.len(), 1);
-    assert!(close(r.matches[0].breakdown["reference"], 0.0));
+    assert!(close(r.matches[0].breakdown.reference, 0.0));
     let r = run(
         &[inv("i1", "INV-1", 10_000)],
         &[pay("p1", 10_000, "INV-10")],
@@ -217,7 +217,7 @@ fn number_followed_by_a_separated_digit_group_is_a_mention() {
         &MatchConfig::default(),
     );
     assert_eq!(r.matches.len(), 1);
-    assert!(close(r.matches[0].breakdown["reference"], 1.0));
+    assert!(close(r.matches[0].breakdown.reference, 1.0));
 }
 
 #[test]
@@ -228,7 +228,7 @@ fn misspelled_reference_yields_a_partial_reference_signal() {
         &MatchConfig::default(),
     );
     assert_eq!(r.matches.len(), 1);
-    let reference = r.matches[0].breakdown["reference"];
+    let reference = r.matches[0].breakdown.reference;
     assert!(reference > 0.8 && reference < 1.0, "got {reference}");
 }
 
@@ -245,7 +245,7 @@ fn payment_mentioning_another_open_invoice_gets_no_fuzzy_reference() {
     );
     assert_eq!(r.matches.len(), 1);
     assert_eq!(r.matches[0].invoice_ids, vec!["i1"]);
-    assert!(close(r.matches[0].breakdown["reference"], 0.0));
+    assert!(close(r.matches[0].breakdown.reference, 0.0));
 }
 
 #[test]
@@ -267,7 +267,7 @@ fn no_reference_matches_under_custom_weights_via_the_candidate_pass() {
         &no_reference_config(),
     );
     assert_eq!(r.matches.len(), 1);
-    assert!(close(r.matches[0].breakdown["reference"], 0.0));
+    assert!(close(r.matches[0].breakdown.reference, 0.0));
     assert_eq!(r.matches[0].status, MatchStatus::Auto);
 }
 
@@ -302,7 +302,7 @@ fn reference_pass_ignores_the_date_window() {
     );
     assert_eq!(r.matches.len(), 1);
     let m = &r.matches[0];
-    assert!(close(m.breakdown["date"], 0.0));
+    assert!(close(m.breakdown.date, 0.0));
     // 0.45 + 0.30 + 0.15 sits on the threshold; the epsilon makes it Auto.
     assert!(close(m.score, 0.90));
     assert_eq!(m.status, MatchStatus::Auto);
@@ -358,7 +358,7 @@ fn accents_and_company_suffixes_are_ignored_in_names() {
     };
     let r = run(&[invoice], &[payment], &MatchConfig::default());
     assert_eq!(r.matches.len(), 1);
-    assert!(close(r.matches[0].breakdown["name"], 1.0));
+    assert!(close(r.matches[0].breakdown.name, 1.0));
 }
 
 #[test]
@@ -570,7 +570,7 @@ fn candidates_closer_than_the_margin_stay_ambiguous() {
 }
 
 fn breakdown_keys(m: &remitmatch::Match) -> Vec<&str> {
-    m.breakdown.keys().map(String::as_str).collect()
+    m.breakdown.iter().map(|(name, _)| name).collect()
 }
 
 #[test]
@@ -591,7 +591,7 @@ fn payment_naming_two_invoices_is_one_to_many_in_input_order() {
         breakdown_keys(m),
         vec!["amount", "date", "name", "reference"]
     );
-    assert!(close(m.breakdown["reference"], 1.0));
+    assert!(close(m.breakdown.reference, 1.0));
     assert!(close(m.score, 1.0));
     assert!(r.unmatched_payments.is_empty() && r.unmatched_invoices.is_empty());
 }
@@ -611,7 +611,7 @@ fn group_fee_within_tolerance_gives_a_negative_residual() {
     let m = &r.matches[0];
     assert_eq!(m.kind, MatchKind::OneToMany);
     assert_eq!(m.residual_minor, -30);
-    assert!(close(m.breakdown["amount"], 0.8));
+    assert!(close(m.breakdown.amount, 0.8));
     assert_eq!(m.status, MatchStatus::Auto);
 }
 
@@ -646,7 +646,7 @@ fn two_payments_citing_one_invoice_whose_sum_fits_are_many_to_one() {
     assert_eq!(m.payment_ids, vec!["p1", "p2"]);
     assert_eq!(m.invoice_ids, vec!["i1"]);
     assert_eq!(m.residual_minor, 0);
-    assert!(close(m.breakdown["reference"], 1.0));
+    assert!(close(m.breakdown.reference, 1.0));
     assert!(r.unmatched_payments.is_empty() && r.unmatched_invoices.is_empty());
 }
 
@@ -831,7 +831,7 @@ fn one_to_many_is_found_by_counterparty_without_a_reference() {
     assert_eq!(m.payment_ids, vec!["p1"]);
     assert_eq!(m.invoice_ids, vec!["i1", "i2"]);
     assert_eq!(m.residual_minor, 0);
-    assert!(close(m.breakdown["reference"], 0.0));
+    assert!(close(m.breakdown.reference, 0.0));
     assert!(close(m.score, 1.0));
 }
 
@@ -848,7 +848,7 @@ fn many_to_one_is_found_by_counterparty_without_a_reference() {
     assert_eq!(m.status, MatchStatus::Auto);
     assert_eq!(m.payment_ids, vec!["p1", "p2"]);
     assert_eq!(m.invoice_ids, vec!["i1"]);
-    assert!(close(m.breakdown["reference"], 0.0));
+    assert!(close(m.breakdown.reference, 0.0));
 }
 
 #[test]
@@ -880,7 +880,7 @@ fn partly_named_group_scores_half_the_reference_signal() {
     let m = &r.matches[0];
     assert_eq!(m.kind, MatchKind::OneToMany);
     assert_eq!(m.invoice_ids, vec!["i1", "i2"]);
-    assert!(close(m.breakdown["reference"], 0.5));
+    assert!(close(m.breakdown.reference, 0.5));
     // 0.45 * 0.5 + 0.30 + 0.15 + 0.10 = 0.775: above suggest, below auto.
     assert_eq!(m.status, MatchStatus::Suggested);
 }
@@ -1275,6 +1275,6 @@ fn a_payment_naming_an_invoice_that_does_not_fit_still_matches_an_unnamed_one() 
     assert_eq!(r.matches.len(), 1);
     assert_eq!(r.matches[0].invoice_ids, vec!["i2"]);
     assert_eq!(r.matches[0].status, MatchStatus::Auto);
-    assert!(close(r.matches[0].breakdown["reference"], 0.0));
+    assert!(close(r.matches[0].breakdown.reference, 0.0));
     assert_eq!(r.unmatched_invoices, vec!["i1"]);
 }

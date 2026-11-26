@@ -30,7 +30,7 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyTuple, PyType};
 use pyo3_arrow::PyTable;
 use remitmatch::{
-    Invoice, Match, MatchConfig, MatchKind, MatchStatus, Payment, ReconciliationResult,
+    Breakdown, Invoice, Match, MatchConfig, MatchKind, MatchStatus, Payment, ReconciliationResult,
 };
 
 /// The Python class `remitmatch._enums.MatchKind`, imported on first use.
@@ -501,6 +501,61 @@ impl PyMatchConfig {
     }
 }
 
+/// A match as the bindings hold it: the core match, plus the breakdown dict when the match was
+/// built by hand from Python.
+///
+/// A hand-built dict may be incomplete or have other keys, which the fixed core breakdown
+/// cannot hold, so it is kept as given and is what Python reads back; matches from the engine
+/// have none, and Python gets a dict built from their four signals.
+#[derive(Clone)]
+struct Held {
+    core: Match,
+    hand_built: Option<BTreeMap<String, f64>>,
+}
+
+impl Held {
+    /// Wraps a match found by the engine.
+    fn from_engine(core: Match) -> Self {
+        Self {
+            core,
+            hand_built: None,
+        }
+    }
+
+    /// Returns the breakdown as the dict Python sees: keys in alphabetical order.
+    fn dict(&self) -> BTreeMap<String, f64> {
+        self.hand_built.clone().unwrap_or_else(|| {
+            self.core
+                .breakdown
+                .iter()
+                .map(|(name, value)| (name.to_owned(), value))
+                .collect()
+        })
+    }
+
+    /// Returns the signal called `name`, or `None` when a hand-built match lacks it.
+    pub(crate) fn signal(&self, name: &str) -> Option<f64> {
+        match &self.hand_built {
+            Some(dict) => dict.get(name).copied(),
+            None => self.core.breakdown.get(name),
+        }
+    }
+}
+
+impl PartialEq for Held {
+    /// Compares every field, the breakdown as the dict Python sees.
+    fn eq(&self, other: &Self) -> bool {
+        let (a, b) = (&self.core, &other.core);
+        a.kind == b.kind
+            && a.status == b.status
+            && a.payment_ids == b.payment_ids
+            && a.invoice_ids == b.invoice_ids
+            && a.score == b.score
+            && a.residual_minor == b.residual_minor
+            && self.dict() == other.dict()
+    }
+}
+
 /// A proposed link between payments and invoices.
 ///
 /// Args:
@@ -518,7 +573,7 @@ impl PyMatchConfig {
 ///     OverflowError: An integer argument is outside the accepted range.
 #[pyclass(frozen, eq, from_py_object, module = "remitmatch", name = "Match")]
 #[derive(Clone, PartialEq)]
-struct PyMatch(Arc<Match>);
+struct PyMatch(Arc<Held>);
 
 #[pymethods]
 impl PyMatch {
@@ -532,21 +587,30 @@ impl PyMatch {
         breakdown: BTreeMap<String, f64>,
         residual_minor: i64,
     ) -> PyResult<Self> {
-        Ok(Self(Arc::new(Match {
-            kind: kind_from_value(&enum_value(kind, &MATCH_KIND, "MatchKind")?)?,
-            status: status_from_value(&enum_value(status, &MATCH_STATUS, "MatchStatus")?)?,
-            payment_ids,
-            invoice_ids,
-            score,
-            breakdown,
-            residual_minor,
+        let signal = |name: &str| breakdown.get(name).copied().unwrap_or_default();
+        Ok(Self(Arc::new(Held {
+            core: Match {
+                kind: kind_from_value(&enum_value(kind, &MATCH_KIND, "MatchKind")?)?,
+                status: status_from_value(&enum_value(status, &MATCH_STATUS, "MatchStatus")?)?,
+                payment_ids,
+                invoice_ids,
+                score,
+                breakdown: Breakdown {
+                    reference: signal("reference"),
+                    amount: signal("amount"),
+                    name: signal("name"),
+                    date: signal("date"),
+                },
+                residual_minor,
+            },
+            hand_built: Some(breakdown),
         })))
     }
 
     /// Cardinality of the match: a MatchKind member.
     #[getter]
     fn kind<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        enum_member(py, &MATCH_KIND, "MatchKind", kind_value(self.0.kind))
+        enum_member(py, &MATCH_KIND, "MatchKind", kind_value(self.0.core.kind))
     }
 
     /// Confidence in the match: a MatchStatus member.
@@ -556,7 +620,7 @@ impl PyMatch {
             py,
             &MATCH_STATUS,
             "MatchStatus",
-            status_value(self.0.status),
+            status_value(self.0.core.status),
         )
     }
 
@@ -566,7 +630,7 @@ impl PyMatch {
     /// repeatedly.
     #[getter]
     fn payment_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        PyTuple::new(py, &self.0.payment_ids)
+        PyTuple::new(py, &self.0.core.payment_ids)
     }
 
     /// Invoices in the match.
@@ -575,13 +639,13 @@ impl PyMatch {
     /// repeatedly.
     #[getter]
     fn invoice_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        PyTuple::new(py, &self.0.invoice_ids)
+        PyTuple::new(py, &self.0.core.invoice_ids)
     }
 
     /// Final weighted score in [0, 1].
     #[getter]
     fn score(&self) -> f64 {
-        self.0.score
+        self.0.core.score
     }
 
     /// Per-signal scores that explain the final score.
@@ -590,13 +654,13 @@ impl PyMatch {
     /// repeatedly.
     #[getter]
     fn breakdown(&self) -> BTreeMap<String, f64> {
-        self.0.breakdown.clone()
+        self.0.dict()
     }
 
     /// Amount difference left after matching (fees, rounding).
     #[getter]
     fn residual_minor(&self) -> i64 {
-        self.0.residual_minor
+        self.0.core.residual_minor
     }
 
     fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
@@ -629,7 +693,7 @@ impl PyMatch {
 #[derive(Clone, PartialEq)]
 struct PyReconciliationResult {
     /// Shared with the `Match` objects returned by the `matches` getter.
-    matches: Vec<Arc<Match>>,
+    matches: Vec<Arc<Held>>,
     unmatched_payments: Vec<String>,
     unmatched_invoices: Vec<String>,
 }
@@ -638,7 +702,11 @@ impl From<ReconciliationResult> for PyReconciliationResult {
     /// Moves each match into its own shared allocation.
     fn from(result: ReconciliationResult) -> Self {
         Self {
-            matches: result.matches.into_iter().map(Arc::new).collect(),
+            matches: result
+                .matches
+                .into_iter()
+                .map(|m| Arc::new(Held::from_engine(m)))
+                .collect(),
             unmatched_payments: result.unmatched_payments,
             unmatched_invoices: result.unmatched_invoices,
         }
