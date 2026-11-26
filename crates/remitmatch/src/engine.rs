@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aho_corasick::{AhoCorasick, MatchKind as AcMatchKind};
 use chrono::NaiveDate;
@@ -91,6 +91,8 @@ struct Engine<'a> {
     /// Character counts of each normalized invoice number, built when the fuzzy reference
     /// prefilter first needs them.
     invoice_number_counts: Vec<LazyCounts>,
+    /// Cache of the name similarity of each pair of distinct names.
+    name_scores: NameScores,
     /// Whether a candidate with no reference signal can neither be accepted nor make another
     /// candidate of its anchor ambiguous; see [`cannot_matter`].
     skip_unnamed: bool,
@@ -100,7 +102,7 @@ struct Engine<'a> {
 struct Names {
     /// For each input row, the position of its name in `distinct`.
     ids: Vec<usize>,
-    /// The normalized name of each distinct raw text, ordered by the raw text.
+    /// The distinct normalized names, in the order of the raw texts they first come from.
     distinct: Vec<String>,
 }
 
@@ -129,15 +131,78 @@ impl Names {
         // Sorted, so the layout does not depend on how the threads were scheduled.
         raw.sort_unstable();
         let position: HashMap<&str, usize> = raw.iter().enumerate().map(|(k, &t)| (t, k)).collect();
+        let normalized = map_rows(&raw, parallel, |&t| normalize_name(t));
+        // Different raw texts often normalize to the same name ("Acme S.L." and "ACME").
+        let mut distinct: Vec<String> = Vec::new();
+        let mut known: HashMap<&str, usize> = HashMap::new();
+        let name_of_raw: Vec<usize> = normalized
+            .iter()
+            .map(|name| {
+                *known.entry(name.as_str()).or_insert_with(|| {
+                    distinct.push(name.clone());
+                    distinct.len() - 1
+                })
+            })
+            .collect();
         Self {
-            ids: map_rows(rows, parallel, |row| position[text(row)]),
-            distinct: map_rows(&raw, parallel, |&t| normalize_name(t)),
+            ids: map_rows(rows, parallel, |row| name_of_raw[position[text(row)]]),
+            distinct,
         }
     }
 
     /// Returns the normalized name of the row with input index `row`.
     fn get(&self, row: usize) -> &str {
         &self.distinct[self.ids[row]]
+    }
+}
+
+/// Largest number of distinct name pairs whose similarity is cached, 32 MB of scores.
+// ponytail: above this many distinct pairs the similarity is computed per candidate, as
+// before. Upgrade: a bounded cache that evicts, if such data turns up.
+const NAME_SCORE_LIMIT: usize = 1 << 22;
+
+/// The bits that mark a cell of [`NameScores`] as not computed yet: a NaN, which no score is.
+const UNSET: u64 = u64::MAX;
+
+/// Name similarity of each pair of distinct names, computed on first use.
+///
+/// The cells are relaxed atomics: two threads may compute the same pair, and both store the
+/// same bits, so no lock is needed and the result never depends on the schedule.
+struct NameScores {
+    /// Number of distinct invoice names, the width of a row of `cells`.
+    width: usize,
+    /// One cell per pair, or empty when there are too many pairs to cache.
+    cells: Vec<AtomicU64>,
+}
+
+impl NameScores {
+    /// Starts with nothing computed for `payments` times `invoices` distinct names; caches
+    /// nothing when that is more than `limit` pairs.
+    fn new(payments: usize, invoices: usize, limit: usize) -> Self {
+        let pairs = payments.saturating_mul(invoices);
+        Self {
+            width: invoices,
+            cells: if pairs <= limit {
+                (0..pairs).map(|_| AtomicU64::new(UNSET)).collect()
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// Returns the score of the pair of distinct names `(payment, invoice)`, calling
+    /// `compute` only when it is not cached yet.
+    fn get(&self, payment: usize, invoice: usize, compute: impl FnOnce() -> f64) -> f64 {
+        let Some(cell) = self.cells.get(payment * self.width + invoice) else {
+            return compute();
+        };
+        let bits = cell.load(Ordering::Relaxed);
+        if bits != UNSET {
+            return f64::from_bits(bits);
+        }
+        let score = compute();
+        cell.store(score.to_bits(), Ordering::Relaxed);
+        score
     }
 }
 
@@ -224,7 +289,14 @@ fn reconcile_validated(
 ) -> Result<ReconciliationResult, Error> {
     let invoice_number = map_rows(invoices, parallel, |i| normalize_reference(&i.number).text);
     let payment_reference = map_rows(payments, parallel, |p| normalize_reference(&p.reference));
+    let invoice_name = Names::new(invoices, parallel, |i| i.counterparty.as_str());
+    let payment_name = Names::new(payments, parallel, |p| p.counterparty.as_str());
     let engine = Engine {
+        name_scores: NameScores::new(
+            payment_name.distinct.len(),
+            invoice_name.distinct.len(),
+            NAME_SCORE_LIMIT,
+        ),
         invoices,
         payments,
         config,
@@ -232,9 +304,9 @@ fn reconcile_validated(
         tolerance: u64::try_from(config.amount_tolerance_minor).unwrap_or(0),
         invoice_number_counts: (0..invoices.len()).map(|_| LazyCounts::default()).collect(),
         invoice_number,
-        invoice_name: Names::new(invoices, parallel, |i| i.counterparty.as_str()),
+        invoice_name,
         payment_reference,
-        payment_name: Names::new(payments, parallel, |p| p.counterparty.as_str()),
+        payment_name,
         skip_unnamed: cannot_matter(&Weights::from_map(&config.weights), config, 0.0),
     };
     let partitions = partitions(invoices, payments);
@@ -474,6 +546,17 @@ impl Engine<'_> {
         Ok(())
     }
 
+    /// Returns the name signal of payment `p` and invoice `i`, cached per pair of distinct names.
+    fn name_score(&self, p: usize, i: usize) -> f64 {
+        let (payment, invoice) = (self.payment_name.ids[p], self.invoice_name.ids[i]);
+        self.name_scores.get(payment, invoice, || {
+            name_signal(
+                &self.payment_name.distinct[payment],
+                &self.invoice_name.distinct[invoice],
+            )
+        })
+    }
+
     /// Returns whether two dates are at most `date_window_days` apart.
     fn within_window(&self, a: NaiveDate, b: NaiveDate) -> bool {
         a.signed_duration_since(b).num_days().unsigned_abs()
@@ -516,10 +599,7 @@ impl Engine<'_> {
         let (mut name, mut date) = (1.0_f64, 0.0_f64);
         for &p in pay_rows {
             for &i in inv_rows {
-                name = name.min(name_signal(
-                    self.payment_name.get(p),
-                    self.invoice_name.get(i),
-                ));
+                name = name.min(self.name_score(p, i));
                 date += date_signal(
                     self.payments[p].value_date,
                     self.invoices[i].due_date,
@@ -1101,12 +1181,16 @@ mod tests {
     }
 
     #[test]
-    fn names_are_normalized_once_per_distinct_text_in_both_modes() {
+    fn names_are_normalized_once_per_distinct_text_and_stored_once_per_distinct_name() {
         let raw = ["Acme S.L.", "ACME", "Acme S.L.", "Beta Inc.", "ACME", ""];
         let build = |parallel: bool| Names::new(&raw, parallel, |text| text);
         for parallel in [false, true] {
             let names = build(parallel);
-            assert_eq!(names.distinct.len(), 4, "one entry per distinct raw text");
+            assert_eq!(
+                names.distinct.len(),
+                3,
+                "one entry per distinct normalized name"
+            );
             for (row, text) in raw.iter().enumerate() {
                 assert_eq!(names.get(row), normalize_name(text), "row {row}");
             }
@@ -1142,6 +1226,44 @@ mod tests {
         for (_, (invoice_rows, payment_rows)) in groups {
             assert!(invoice_rows.is_sorted() && payment_rows.is_sorted());
             assert_eq!((invoice_rows.len(), payment_rows.len()), (6, 5));
+        }
+    }
+
+    #[test]
+    fn name_scores_are_computed_once_per_distinct_pair() {
+        let scores = NameScores::new(3, 2, 6);
+        let calls = std::cell::Cell::new(0);
+        let get = |p: usize, i: usize| {
+            scores.get(p, i, || {
+                calls.set(calls.get() + 1);
+                (p * 10 + i) as f64 / 100.0
+            })
+        };
+        for _ in 0..3 {
+            for (p, i) in [(0, 0), (2, 1), (1, 0), (2, 1)] {
+                assert_eq!(get(p, i), (p * 10 + i) as f64 / 100.0);
+            }
+        }
+        assert_eq!(calls.get(), 3, "three distinct pairs were asked for");
+    }
+
+    #[test]
+    fn name_scores_keep_a_zero_and_skip_the_cache_over_the_limit() {
+        let scores = NameScores::new(2, 2, 3);
+        let calls = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            assert_eq!(
+                scores.get(1, 1, || {
+                    calls.set(calls.get() + 1);
+                    0.0
+                }),
+                0.0
+            );
+        }
+        assert_eq!(calls.get(), 2, "four pairs exceed the limit of three");
+        let cached = NameScores::new(2, 2, 4);
+        for _ in 0..2 {
+            assert_eq!(cached.get(1, 1, || 0.0), 0.0);
         }
     }
 
