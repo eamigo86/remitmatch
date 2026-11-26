@@ -22,16 +22,19 @@ pub(crate) fn find_subsets(
     limit: usize,
 ) -> Vec<Vec<usize>> {
     let pool = &amounts[..amounts.len().min(GROUP_CANDIDATE_LIMIT)];
-    if pool.len() < 2 {
+    if pool.len() < 2 || max_size < 2 {
         // A subset has at least two amounts, and most pools hold one.
+        return Vec::new();
+    }
+    let low = i128::from(target) - i128::from(tolerance);
+    let high = i128::from(target) + i128::from(tolerance);
+    if cannot_reach(pool, max_size, low, high) {
         return Vec::new();
     }
     let (left, right) = pool.split_at(pool.len() / 2);
     let left_subsets = subsets_of(left, max_size);
     let mut right_subsets = subsets_of(right, max_size);
     right_subsets.sort_unstable();
-    let low = i128::from(target) - i128::from(tolerance);
-    let high = i128::from(target) + i128::from(tolerance);
     let mut found = Vec::new();
     // Sums outside this range of the right half cannot match, which skips most searches.
     let (lowest, highest) = match (right_subsets.first(), right_subsets.last()) {
@@ -56,6 +59,29 @@ pub(crate) fn find_subsets(
         }
     }
     found
+}
+
+/// Returns whether no subset of 2 to `max_size` amounts of `pool` can sum to a value in
+/// `low..=high`, judged from the extremes alone.
+///
+/// Only decided for positive amounts: then every subset sums to at least the two smallest
+/// amounts and to at most the largest `max_size`. Any other pool is never ruled out.
+fn cannot_reach(pool: &[i64], max_size: usize, low: i128, high: i128) -> bool {
+    let mut sorted = [0_i64; GROUP_CANDIDATE_LIMIT];
+    let sorted = &mut sorted[..pool.len()];
+    sorted.copy_from_slice(pool);
+    sorted.sort_unstable();
+    if sorted[0] <= 0 {
+        return false;
+    }
+    let smallest_two = i128::from(sorted[0]) + i128::from(sorted[1]);
+    let largest: i128 = sorted
+        .iter()
+        .rev()
+        .take(max_size)
+        .map(|&amount| i128::from(amount))
+        .sum();
+    smallest_two > high || largest < low
 }
 
 /// Lists every subset of `half` with at most `max_size` members as `(sum, size, mask)`.
@@ -256,6 +282,33 @@ mod tests {
             }
         }
         found
+    }
+
+    #[test]
+    fn the_sum_bounds_rule_out_pools_and_keep_the_pools_at_the_edge() {
+        // The two smallest add up to 30: a target of 29 cannot be reached, 30 can.
+        assert!(find_subsets(&[15, 15, 40, 90], 29, 0, 4, 32).is_empty());
+        assert_eq!(
+            find_subsets(&[15, 15, 40, 90], 30, 0, 4, 32),
+            vec![vec![0, 1]]
+        );
+        assert_eq!(
+            find_subsets(&[15, 15, 40, 90], 28, 2, 4, 32),
+            vec![vec![0, 1]]
+        );
+        // At most two amounts per subset: the largest two add up to 130.
+        assert!(find_subsets(&[15, 15, 40, 90], 131, 0, 2, 32).is_empty());
+        assert_eq!(
+            find_subsets(&[15, 15, 40, 90], 130, 0, 2, 32),
+            vec![vec![2, 3]]
+        );
+        assert_eq!(
+            find_subsets(&[15, 15, 40, 90], 132, 2, 2, 32),
+            vec![vec![2, 3]]
+        );
+        // A zero or negative amount is never ruled out by the bounds.
+        assert_eq!(find_subsets(&[0, 5, 9], 5, 0, 3, 32), vec![vec![0, 1]]);
+        assert_eq!(find_subsets(&[-5, 20, 30], 15, 0, 3, 32), vec![vec![0, 1]]);
     }
 
     proptest! {
