@@ -36,9 +36,18 @@ const COMPANY_SUFFIXES: &[&str] = &[
 pub(crate) struct Reference {
     /// Uppercased text without whitespace or dashes.
     pub(crate) text: String,
-    /// For each byte of `text`, whether whitespace was removed right before it.
-    /// Dashes never count as gaps.
-    pub(crate) gap_before: Vec<bool>,
+    /// The byte offsets of `text`, ascending, right before which whitespace was removed
+    /// (one per gap, at the first byte of the character that follows it).
+    /// Dashes never count as gaps; most references have few gaps or none.
+    gaps: Vec<usize>,
+}
+
+impl Reference {
+    /// Returns whether whitespace was removed right before the character that starts at byte
+    /// `edge` of `text`.
+    pub(crate) fn gap_before(&self, edge: usize) -> bool {
+        self.gaps.binary_search(&edge).is_ok()
+    }
 }
 
 /// Uppercases `input` and removes whitespace and dashes, tracking whitespace gaps.
@@ -46,20 +55,22 @@ pub(crate) struct Reference {
 /// Also used for invoice numbers, where the gap information is ignored.
 pub(crate) fn normalize_reference(input: &str) -> Reference {
     let mut text = String::with_capacity(input.len());
-    let mut gap_before = Vec::with_capacity(input.len());
+    let mut gaps = Vec::new();
     let mut gap = false;
     for c in input.chars() {
         if c.is_whitespace() {
             gap = true;
         } else if c != '-' {
+            if gap {
+                gaps.push(text.len());
+            }
             for u in c.to_uppercase() {
                 text.push(u);
-                gap_before.extend(std::iter::repeat_n(gap, u.len_utf8()));
             }
             gap = false;
         }
     }
-    Reference { text, gap_before }
+    Reference { text, gaps }
 }
 
 /// Normalizes a counterparty name: no accents, lowercase, no punctuation or company suffix.
@@ -94,23 +105,35 @@ mod tests {
     fn reference_marks_gaps_only_for_removed_whitespace() {
         let r = normalize_reference("INV-1 10");
         assert_eq!(r.text, "INV110");
-        assert_eq!(r.gap_before.len(), r.text.len());
-        let gaps: Vec<usize> = (0..r.text.len()).filter(|&i| r.gap_before[i]).collect();
+        let gaps: Vec<usize> = (0..=r.text.len()).filter(|&i| r.gap_before(i)).collect();
         assert_eq!(gaps, vec![4]);
     }
 
     #[test]
-    fn reference_gap_flags_cover_every_byte_of_multibyte_chars() {
+    fn reference_gap_is_marked_at_the_first_byte_of_a_multibyte_char() {
         let r = normalize_reference("A é");
         assert_eq!(r.text, "AÉ");
-        assert_eq!(r.gap_before, vec![false, true, true]);
+        assert!(!r.gap_before(0) && r.gap_before(1));
+    }
+
+    #[test]
+    fn reference_gaps_are_kept_sorted_and_whitespace_runs_count_once() {
+        let r = normalize_reference("  A 1  2\t3 ");
+        assert_eq!(r.text, "A123");
+        let gaps: Vec<usize> = (0..=r.text.len()).filter(|&i| r.gap_before(i)).collect();
+        assert_eq!(
+            gaps,
+            vec![0, 1, 2, 3],
+            "a leading gap, then one per run; a trailing one has no byte"
+        );
+        assert!(normalize_reference("ABC").gaps.is_empty());
     }
 
     #[test]
     fn empty_reference_is_empty() {
         let r = normalize_reference(" - ");
         assert!(r.text.is_empty());
-        assert!(r.gap_before.is_empty());
+        assert!(r.gaps.is_empty());
     }
 
     #[test]
