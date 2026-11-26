@@ -355,11 +355,12 @@ def _machine() -> dict[str, Any]:
     return {"model": model, "cpu_count": os.cpu_count(), "memory_bytes": memory}
 
 
-def _packages(build: str) -> dict[str, Any]:
+def _packages(build: str, commit: str) -> dict[str, Any]:
     """Collect the versions of the packages that take part in the measurement.
 
     Args:
         build: Build profile of the installed remitmatch, as declared on the command line.
+        commit: Git commit the installed remitmatch was built from, as declared.
 
     Returns:
         Versions by package name; remitmatch also carries its core version and build.
@@ -374,6 +375,7 @@ def _packages(build: str) -> dict[str, Any]:
         "version": remitmatch.__version__,
         "core_version": remitmatch.version(),
         "build": build,
+        "commit": commit,
     }
     return versions
 
@@ -405,6 +407,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=600, help="seconds for the matching call")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--remitmatch-build", default="unknown", help="build profile to record")
+    parser.add_argument("--commit", default="unknown", help="git commit of the build to record")
     parser.add_argument("--note", default="", help="free text recorded in the results file")
     options = parser.parse_args(args)
 
@@ -413,7 +416,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "machine": _machine(),
         "os": platform.platform(),
         "python": platform.python_version(),
-        "packages": _packages(options.remitmatch_build),
+        "packages": _packages(options.remitmatch_build, options.commit),
         "rayon_num_threads": os.environ.get("RAYON_NUM_THREADS"),
         "seed": options.seed,
         "scopes": options.scopes,
