@@ -2,7 +2,7 @@
 //!
 //! The entry point is [`reconcile`], which pairs [`Payment`]s with [`Invoice`]s (1:1, 1:N
 //! and N:1) and returns a [`ReconciliationResult`]. Every [`Match`] carries a per-signal
-//! `breakdown` that explains its score.
+//! [`Breakdown`] that explains its score.
 //!
 //! The reference passes look for invoice numbers inside the payment reference: a payment
 //! that names several invoices whose amounts add up is a 1:N match, and several payments
@@ -146,6 +146,84 @@ pub enum MatchStatus {
     Ambiguous,
 }
 
+/// The four raw signals behind the score of a [`Match`], each in the range 0 to 1.
+///
+/// The signals are the same whatever the weights: the weights only decide how much each one
+/// counts in [`Match::score`].
+///
+/// # Examples
+///
+/// ```
+/// use remitmatch::Breakdown;
+///
+/// let breakdown = Breakdown {
+///     reference: 1.0,
+///     amount: 0.5,
+///     name: 0.25,
+///     date: 0.0,
+/// };
+/// assert_eq!(breakdown.get("amount"), Some(0.5));
+/// let names: Vec<&str> = breakdown.iter().map(|(name, _)| name).collect();
+/// assert_eq!(names, Breakdown::NAMES);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Breakdown {
+    /// How well the payment reference names the invoice number.
+    pub reference: f64,
+    /// How close the amounts are, within the tolerance.
+    pub amount: f64,
+    /// How similar the counterparty names are.
+    pub name: f64,
+    /// How close the value date is to the due date, within the window.
+    pub date: f64,
+}
+
+impl Breakdown {
+    /// The signal names, in the order of [`Breakdown::iter`]: alphabetical.
+    pub const NAMES: [&'static str; 4] = ["amount", "date", "name", "reference"];
+
+    /// Returns the value of the signal called `name`, or `None` for any other name.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use remitmatch::Breakdown;
+    ///
+    /// let breakdown = Breakdown { reference: 1.0, amount: 0.8, name: 0.5, date: 0.0 };
+    /// assert_eq!(breakdown.get("reference"), Some(1.0));
+    /// assert_eq!(breakdown.get("colour"), None);
+    /// ```
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<f64> {
+        self.iter()
+            .find_map(|(signal, value)| (signal == name).then_some(value))
+    }
+
+    /// Returns the `(name, value)` pairs in the order of [`Breakdown::NAMES`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use remitmatch::Breakdown;
+    ///
+    /// let breakdown = Breakdown { reference: 1.0, amount: 0.8, name: 0.5, date: 0.0 };
+    /// let pairs: Vec<(&str, f64)> = breakdown.iter().collect();
+    /// assert_eq!(
+    ///     pairs,
+    ///     [("amount", 0.8), ("date", 0.0), ("name", 0.5), ("reference", 1.0)]
+    /// );
+    /// ```
+    pub fn iter(&self) -> impl Iterator<Item = (&'static str, f64)> {
+        [
+            ("amount", self.amount),
+            ("date", self.date),
+            ("name", self.name),
+            ("reference", self.reference),
+        ]
+        .into_iter()
+    }
+}
+
 /// A proposed link between payments and invoices.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Match {
@@ -160,7 +238,7 @@ pub struct Match {
     /// Final weighted score in the range 0 to 1.
     pub score: f64,
     /// Per-signal scores that explain the final score.
-    pub breakdown: BTreeMap<String, f64>,
+    pub breakdown: Breakdown,
     /// Amount difference left after matching, in minor units (fees, rounding).
     pub residual_minor: i64,
 }
@@ -266,6 +344,31 @@ pub fn reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_breakdown_lists_and_looks_up_its_signals_in_name_order() {
+        let breakdown = Breakdown {
+            reference: 1.0,
+            amount: 0.5,
+            name: 0.25,
+            date: 0.125,
+        };
+        let pairs: Vec<(&str, f64)> = breakdown.iter().collect();
+        assert_eq!(
+            pairs,
+            [
+                ("amount", 0.5),
+                ("date", 0.125),
+                ("name", 0.25),
+                ("reference", 1.0)
+            ]
+        );
+        for (name, value) in pairs {
+            assert_eq!(breakdown.get(name), Some(value));
+        }
+        assert_eq!(breakdown.get("Amount"), None);
+        assert_eq!(breakdown.get(""), None);
+    }
 
     #[test]
     fn version_matches_cargo_package_version() {

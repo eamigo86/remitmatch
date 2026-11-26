@@ -23,7 +23,9 @@ use pyo3::exceptions::{PyOverflowError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 use pyo3_arrow::PyRecordBatchReader;
-use remitmatch::{Invoice, Match, Payment};
+use remitmatch::{Invoice, Payment};
+
+use crate::Held;
 
 /// Milliseconds in one day, the unit of an Arrow `date64` value.
 const MILLIS_PER_DAY: i64 = 86_400_000;
@@ -260,14 +262,15 @@ fn dates(batch: &RecordBatch, name: &str) -> PyResult<Vec<NaiveDate>> {
 /// then payment order, then invoice order.
 ///
 /// A signal missing from a hand-built match breakdown is a null in its column.
-pub(crate) fn matches_batch(matches: &[Arc<Match>]) -> PyResult<RecordBatch> {
-    let pairs: Vec<(usize, &Match, &str, &str)> = matches
+pub(crate) fn matches_batch(matches: &[Arc<Held>]) -> PyResult<RecordBatch> {
+    let pairs: Vec<(usize, &Held, &str, &str)> = matches
         .iter()
         .map(Arc::as_ref)
         .enumerate()
         .flat_map(|(index, m)| {
-            m.payment_ids.iter().flat_map(move |payment| {
-                m.invoice_ids
+            m.core.payment_ids.iter().flat_map(move |payment| {
+                m.core
+                    .invoice_ids
                     .iter()
                     .map(move |invoice| (index, m, payment.as_str(), invoice.as_str()))
             })
@@ -280,9 +283,7 @@ pub(crate) fn matches_batch(matches: &[Arc<Match>]) -> PyResult<RecordBatch> {
         .map_err(|_| PyOverflowError::new_err("too many matches for a uint32 match_index"))?;
     let signal = |name: &str| -> ArrayRef {
         Arc::new(Float64Array::from_iter(
-            pairs
-                .iter()
-                .map(|(_, m, ..)| m.breakdown.get(name).copied()),
+            pairs.iter().map(|(_, m, ..)| m.signal(name)),
         ))
     };
     let columns: Vec<(&str, ArrayRef)> = vec![
@@ -290,13 +291,17 @@ pub(crate) fn matches_batch(matches: &[Arc<Match>]) -> PyResult<RecordBatch> {
         (
             "kind",
             Arc::new(StringArray::from_iter_values(
-                pairs.iter().map(|(_, m, ..)| crate::kind_value(m.kind)),
+                pairs
+                    .iter()
+                    .map(|(_, m, ..)| crate::kind_value(m.core.kind)),
             )),
         ),
         (
             "status",
             Arc::new(StringArray::from_iter_values(
-                pairs.iter().map(|(_, m, ..)| crate::status_value(m.status)),
+                pairs
+                    .iter()
+                    .map(|(_, m, ..)| crate::status_value(m.core.status)),
             )),
         ),
         (
@@ -314,13 +319,13 @@ pub(crate) fn matches_batch(matches: &[Arc<Match>]) -> PyResult<RecordBatch> {
         (
             "score",
             Arc::new(Float64Array::from_iter_values(
-                pairs.iter().map(|(_, m, ..)| m.score),
+                pairs.iter().map(|(_, m, ..)| m.core.score),
             )),
         ),
         (
             "residual_minor",
             Arc::new(Int64Array::from_iter_values(
-                pairs.iter().map(|(_, m, ..)| m.residual_minor),
+                pairs.iter().map(|(_, m, ..)| m.core.residual_minor),
             )),
         ),
         ("reference_score", signal("reference")),

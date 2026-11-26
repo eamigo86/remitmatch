@@ -205,10 +205,10 @@ fn check(
         }
         prop_assert!(payment_sum.abs_diff(invoice_sum) <= config.amount_tolerance_minor as u128);
         prop_assert_eq!(i128::from(m.residual_minor), payment_sum - invoice_sum);
-        let keys: Vec<&str> = m.breakdown.keys().map(String::as_str).collect();
+        let keys: Vec<&str> = m.breakdown.iter().map(|(name, _)| name).collect();
         prop_assert_eq!(keys, vec!["amount", "date", "name", "reference"]);
         prop_assert!((0.0..=1.0).contains(&m.score));
-        prop_assert!(m.breakdown.values().all(|v| (0.0..=1.0).contains(v)));
+        prop_assert!(m.breakdown.iter().all(|(_, v)| (0.0..=1.0).contains(&v)));
         prop_assert!(m.score >= config.suggest_threshold - 1e-9);
         if m.status == MatchStatus::Auto {
             prop_assert!(m.score >= config.auto_threshold - 1e-9);

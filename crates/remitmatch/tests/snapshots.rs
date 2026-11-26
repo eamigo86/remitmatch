@@ -359,7 +359,7 @@ fn dump(result: &ReconciliationResult) -> String {
             m.invoice_ids.join(","),
             m.score.to_bits()
         );
-        for (key, value) in &m.breakdown {
+        for (key, value) in m.breakdown.iter() {
             let _ = write!(out, " {key}={:016x}", value.to_bits());
         }
         let _ = writeln!(out, " residual={}", m.residual_minor);

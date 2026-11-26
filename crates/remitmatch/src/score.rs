@@ -5,6 +5,8 @@ use std::sync::OnceLock;
 
 use chrono::NaiveDate;
 
+use crate::Breakdown;
+
 /// Tolerance for comparing floating-point scores against thresholds.
 pub(crate) const EPS: f64 = 1e-9;
 
@@ -263,17 +265,14 @@ pub(crate) fn weighted_score(signals: &Signals, weights: &Weights) -> f64 {
         / total
 }
 
-/// Returns the four raw signals keyed by `reference`, `amount`, `name` and `date`.
-pub(crate) fn breakdown(signals: &Signals) -> BTreeMap<String, f64> {
-    [
-        ("reference", signals.reference),
-        ("amount", signals.amount),
-        ("name", signals.name),
-        ("date", signals.date),
-    ]
-    .into_iter()
-    .map(|(key, value)| (key.to_owned(), value))
-    .collect()
+/// Returns the four raw signals as the public breakdown of a match.
+pub(crate) fn breakdown(signals: &Signals) -> Breakdown {
+    Breakdown {
+        reference: signals.reference,
+        amount: signals.amount,
+        name: signals.name,
+        date: signals.date,
+    }
 }
 
 /// Returns whether `score` reaches `threshold`, tolerating floating-point noise.
@@ -391,10 +390,11 @@ mod tests {
             date: 0.0,
         };
         let b = breakdown(&s);
-        let keys: Vec<&str> = b.keys().map(String::as_str).collect();
+        let keys: Vec<&str> = b.iter().map(|(name, _)| name).collect();
         assert_eq!(keys, vec!["amount", "date", "name", "reference"]);
-        assert!(close(b["amount"], 0.5));
-        assert!(close(b["reference"], 1.0));
+        assert!(close(b.amount, 0.5));
+        assert!(close(b.reference, 1.0));
+        assert!(close(b.name, 0.25) && close(b.date, 0.0));
     }
 
     #[test]
