@@ -172,6 +172,73 @@ pub(crate) fn fuzzy_reference_signal_with(
     {
         return 0.0;
     }
+    let best = if number.is_ascii() && reference.is_ascii() {
+        best_ascii_window(number, reference, n)
+    } else {
+        best_char_window(number, reference, n)
+    };
+    if best >= FUZZY_FLOOR { best } else { 0.0 }
+}
+
+/// Returns the similarity of two texts of `len1` and `len2` characters at edit distance `dist`.
+///
+/// The same expression as [`strsim::normalized_damerau_levenshtein`], so the bits agree.
+fn similarity(dist: usize, len1: usize, len2: usize) -> f64 {
+    1.0 - (dist as f64) / (len1.max(len2) as f64)
+}
+
+/// Returns the largest edit distance whose similarity still reaches [`FUZZY_FLOOR`] for texts
+/// of `len1` and `len2` characters.
+fn max_edits(len1: usize, len2: usize) -> usize {
+    let mut dist = 0;
+    while similarity(dist + 1, len1, len2) >= FUZZY_FLOOR {
+        dist += 1;
+    }
+    dist
+}
+
+/// Returns the best similarity of `number`, of `n` characters, to any window of `reference`
+/// with `n - 1`, `n` or `n + 1` characters; both texts are ASCII.
+///
+/// A window that lacks more characters of `number` than the edit budget allows cannot be
+/// close enough (every edit repairs at most one missing character), so the window's counts
+/// are kept while it slides and only the windows within budget get the full distance.
+fn best_ascii_window(number: &str, reference: &str, n: usize) -> f64 {
+    let (wanted_bytes, text) = (number.as_bytes(), reference.as_bytes());
+    let mut wanted = [0_u32; 128];
+    for &b in wanted_bytes {
+        wanted[usize::from(b)] += 1;
+    }
+    let mut best = 0.0_f64;
+    for len in (n - 1)..=(n + 1) {
+        let budget = max_edits(n, len);
+        let mut have = [0_u32; 128];
+        let mut missing = n;
+        for (end, &added) in text.iter().enumerate() {
+            let added = usize::from(added);
+            if have[added] < wanted[added] {
+                missing -= 1;
+            }
+            have[added] += 1;
+            if end >= len {
+                let dropped = usize::from(text[end - len]);
+                have[dropped] -= 1;
+                if have[dropped] < wanted[dropped] {
+                    missing += 1;
+                }
+            }
+            if end + 1 >= len && missing <= budget {
+                let window = &reference[end + 1 - len..=end];
+                let dist = strsim::damerau_levenshtein(number, window);
+                best = best.max(similarity(dist, n, len));
+            }
+        }
+    }
+    best
+}
+
+/// Same as [`best_ascii_window`] for any text, one window at a time.
+fn best_char_window(number: &str, reference: &str, n: usize) -> f64 {
     let chars: Vec<char> = reference.chars().collect();
     let mut best = 0.0_f64;
     for len in (n - 1)..=(n + 1) {
@@ -180,7 +247,7 @@ pub(crate) fn fuzzy_reference_signal_with(
             best = best.max(strsim::normalized_damerau_levenshtein(number, &candidate));
         }
     }
-    if best >= FUZZY_FLOOR { best } else { 0.0 }
+    best
 }
 
 /// Combines the signals into `sum(w * s) / sum(w)`.
@@ -413,6 +480,68 @@ mod tests {
         let missing = CharCounts::of(number).missing_from(&CharCounts::of(reference));
         assert!(missing > (number.chars().count() + 1) / 5);
         assert!(close(counted(number, reference), 0.0));
+    }
+
+    /// The search as it was before the window bound: every window, one `String` each.
+    fn naive_fuzzy_signal(number: &str, reference: &str) -> f64 {
+        let n = number.chars().count();
+        if n < FUZZY_MIN_LEN || reference.contains(number) {
+            return 0.0;
+        }
+        let chars: Vec<char> = reference.chars().collect();
+        let mut best = 0.0_f64;
+        for len in (n - 1)..=(n + 1) {
+            for window in chars.windows(len) {
+                let candidate: String = window.iter().collect();
+                best = best.max(strsim::normalized_damerau_levenshtein(number, &candidate));
+            }
+        }
+        if best >= FUZZY_FLOOR { best } else { 0.0 }
+    }
+
+    #[test]
+    fn the_edit_budget_is_the_most_that_still_reaches_the_floor() {
+        assert_eq!(max_edits(4, 4), 0);
+        assert_eq!(max_edits(4, 5), 1);
+        assert_eq!(max_edits(10, 10), 2);
+        assert_eq!(max_edits(10, 11), 2);
+        assert_eq!(max_edits(10, 9), 2);
+        assert_eq!(max_edits(15, 16), 3);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn the_window_bound_never_changes_the_signal(
+            number in "[ABC1]{4,9}",
+            reference in "[ABC1 ]{0,30}",
+        ) {
+            proptest::prop_assert_eq!(
+                fuzzy_reference_signal(&number, &reference).to_bits(),
+                naive_fuzzy_signal(&number, &reference).to_bits()
+            );
+        }
+
+        #[test]
+        fn the_window_bound_never_changes_the_signal_for_non_ascii_text(
+            number in "[AB\u{c9}1]{4,8}",
+            reference in "[AB\u{c9}1]{0,24}",
+        ) {
+            proptest::prop_assert_eq!(
+                fuzzy_reference_signal(&number, &reference).to_bits(),
+                naive_fuzzy_signal(&number, &reference).to_bits()
+            );
+        }
+
+        #[test]
+        fn the_window_bound_finds_every_close_window_in_longer_digit_text(
+            number in "INV[0-9]{4,7}",
+            reference in "[IN V0-9]{0,60}",
+        ) {
+            proptest::prop_assert_eq!(
+                fuzzy_reference_signal(&number, &reference).to_bits(),
+                naive_fuzzy_signal(&number, &reference).to_bits()
+            );
+        }
     }
 
     proptest::proptest! {
