@@ -20,13 +20,25 @@ assumes the invoice numbers start with INV (remitmatch does not need to know the
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
 from generate import Group, Invoice, Payment
 from rapidfuzz import fuzz, process
 
+INVOICE_PREFIX = "INV"
+"""Prefix of the invoice numbers this baseline looks for in the references.
+
+The choice favours the baseline: knowing the prefix turns the exact pass into one regular
+expression. Invoice numbers with any other prefix are never found, so on such data the
+baseline matches nothing (remitmatch does not need to know the prefix). A prefix-agnostic
+pattern costs time.
+"""
+_TOKEN = rf"{INVOICE_PREFIX}\d+"
 _WINDOW_DAYS = 30
 _FULL_DATE_SCORE_DAYS = 3
 _THRESHOLD = 0.60
@@ -59,6 +71,49 @@ def _day_numbers(dates: pd.Series) -> np.ndarray:
         Whole days since the epoch as int64.
     """
     return pd.to_datetime(dates).to_numpy().astype("datetime64[D]").astype(np.int64)
+
+
+def _normalize(column: pd.Series) -> pa.Array:
+    """Upper-case a text column and remove spaces, dashes and slashes, with pyarrow compute.
+
+    Args:
+        column: Text column.
+
+    Returns:
+        The normalized strings.
+    """
+    return pc.replace_substring_regex(pc.utf8_upper(pa.array(column)), r"[\s/-]", "")
+
+
+def _tokens(references: pa.Array) -> tuple[np.ndarray, np.ndarray]:
+    """Find the invoice-like numbers in normalized references.
+
+    Most references name one number, which pyarrow extracts in one pass; the few that name
+    several are split with the re module.
+
+    Args:
+        references: Normalized references.
+
+    Returns:
+        Payment positions and the number found there, one entry per payment and number.
+    """
+    counts = pc.count_substring_regex(references, _TOKEN).to_numpy(zero_copy_only=False)
+    one = np.flatnonzero(counts == 1)
+    first = pc.extract_regex(references, rf"(?P<t>{_TOKEN})").field("t")
+    positions = [one]
+    found = [first.take(pa.array(one)).to_numpy(zero_copy_only=False).astype(object)]
+    many = np.flatnonzero(counts > 1)
+    if len(many):
+        extra = [
+            (p, t)
+            for p, text in zip(
+                many.tolist(), references.take(pa.array(many)).to_pylist(), strict=True
+            )
+            for t in re.findall(_TOKEN, text)
+        ]
+        positions.append(np.array([p for p, _ in extra], dtype=np.int64))
+        found.append(np.array([t for _, t in extra], dtype=object))
+    return np.concatenate(positions).astype(np.int64), np.concatenate(found)
 
 
 def _greedy(p: np.ndarray, i: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -119,17 +174,15 @@ def match(
     pay = _frame(payments)
     inv_amount = inv["amount_minor"].to_numpy(dtype=np.int64)
     pay_amount = pay["amount_minor"].to_numpy(dtype=np.int64)
-    codes = pd.factorize(
-        pd.concat([inv["scope"] + "|" + inv["currency"], pay["scope"] + "|" + pay["currency"]])
-    )[0].astype(np.int64)
+    scopes = pd.factorize(pd.concat([inv["scope"], pay["scope"]]))[0].astype(np.int64)
+    currencies = pd.factorize(pd.concat([inv["currency"], pay["currency"]]))[0].astype(np.int64)
+    codes = scopes * (int(currencies.max()) + 1) + currencies
     inv_key, pay_key = codes[: len(inv)], codes[len(inv) :]
 
-    numbers = inv["number"].str.upper().str.replace(r"[\s/-]", "", regex=True)
-    references = pay["reference"].str.upper().str.replace(r"[\s/-]", "", regex=True)
-    found = references.str.findall(r"INV\d+").explode().dropna()
-    cand = pd.DataFrame({"p": found.index.to_numpy(dtype=np.int64), "token": found.to_numpy()})
-    cand = cand.drop_duplicates()
-    cand = cand.merge(
+    numbers = pd.Series(_normalize(inv["number"]), dtype=object)
+    found_p, found_token = _tokens(_normalize(pay["reference"]))
+    found = pd.DataFrame({"p": found_p, "token": found_token}).drop_duplicates()
+    cand = found.merge(
         pd.DataFrame({"token": numbers.to_numpy(), "i": np.arange(len(inv), dtype=np.int64)}),
         on="token",
     )
@@ -140,8 +193,7 @@ def match(
     order = np.lexsort((i_arr, p_arr, diff))
     exact_p, exact_i = _greedy(p_arr[order], i_arr[order])
 
-    tokens = pd.DataFrame({"p": found.index.to_numpy(dtype=np.int64), "token": found.to_numpy()})
-    tokens = tokens.drop_duplicates()
+    tokens = found
     tokens = tokens[~tokens["p"].isin(exact_p)]
     free = np.ones(len(inv), dtype=bool)
     free[exact_i] = False

@@ -285,9 +285,10 @@ def test_baseline_matches_everything_on_noise_free_data(match: Matcher) -> None:
 def test_baseline_is_precise_on_noisy_data(match: Matcher) -> None:
     """On realistic one-to-one noise the proposed matches are almost all right.
 
-    Precision is held above 0.97: the only way to be wrong is a misspelled number that lands on
-    another invoice of similar amount. Recall is held above 0.80: payments without an invoice
-    number (5 percent) cannot be matched by reference, and the rest depend on the fuzzy pass.
+    Measured on this data set: precision 1.0000 and recall 0.9515 for both baselines. The floors
+    sit just below: precision 0.999, because the only way to be wrong is a misspelled number
+    that lands on another invoice of similar amount, and recall 0.95, because payments without
+    an invoice number (5 percent of those that settle something) cannot be matched by reference.
 
     Args:
         match: Baseline under test.
@@ -295,8 +296,8 @@ def test_baseline_is_precise_on_noisy_data(match: Matcher) -> None:
     data = generate.generate(5_000, generate.ONE_TO_ONE, seed=7)
     accuracy = generate.evaluate(match(data.invoices, data.payments, 300), data.solution)
     print(f"{match.__module__}: precision {accuracy.precision:.4f} recall {accuracy.recall:.4f}")
-    assert accuracy.precision >= 0.97
-    assert accuracy.recall >= 0.80
+    assert accuracy.precision >= 0.999
+    assert accuracy.recall >= 0.95
 
 
 @pytest.mark.parametrize("match", BASELINES)
@@ -439,3 +440,43 @@ def test_plot_draws_the_chart_files(tmp_path: Path) -> None:
     plot.draw(source, png, svg)
     assert png.read_bytes().startswith(b"\x89PNG")
     assert svg.read_text(encoding="utf-8").lstrip().startswith(("<?xml", "<svg"))
+
+
+@pytest.mark.parametrize("match", BASELINES)
+def test_baseline_rejects_a_candidate_below_the_score_threshold(match: Matcher) -> None:
+    """A misspelled number alone does not make a match when the other signals are worthless.
+
+    The payment is short by the whole tolerance (amount signal 0), arrives at the end of the
+    date window (date signal 0) and carries an unrelated payer name (name signal 0), so only
+    the reference signal counts: 0.45 times about 0.96, below the 0.60 threshold.
+
+    Args:
+        match: Baseline under test.
+    """
+    due = datetime.date(2024, 3, 31)
+    invoice = generate.Invoice(
+        "i1", "INV-2024-0000001", 100_000, "EUR", due - datetime.timedelta(30), due, "Acme", "s"
+    )
+    payment = generate.Payment(
+        "p1", 99_700, "EUR", due + datetime.timedelta(30), "Payment INV-2024-000001", "ZZZZ", "s"
+    )
+    assert match([invoice], [payment], 300) == []
+    # The same payment with a matching payer name and a close date is accepted.
+    close = payment._replace(counterparty="Acme", value_date=due)
+    assert match([invoice], [close], 300) == [(("p1",), ("i1",))]
+
+
+@pytest.mark.parametrize("module", [pure_python, pandas_rapidfuzz], ids=["pure", "pandas"])
+def test_baselines_know_only_the_inv_prefix(module: object) -> None:
+    """The prefix is a named constant, and numbers with another prefix are never found.
+
+    Args:
+        module: Baseline module under test.
+    """
+    assert module.INVOICE_PREFIX == "INV"  # type: ignore[attr-defined]
+    due = datetime.date(2024, 3, 31)
+    invoice = generate.Invoice(
+        "i1", "FAC-2024-0000001", 100_000, "EUR", due - datetime.timedelta(30), due, "Acme", "s"
+    )
+    payment = generate.Payment("p1", 100_000, "EUR", due, "Payment FAC-2024-0000001", "Acme", "s")
+    assert module.match([invoice], [payment], 300) == []  # type: ignore[attr-defined]
